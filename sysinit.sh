@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 ################################################################################
 #   Author      : 0x5c0f (Enhanced with Dev-Sec Baseline & Anti-Lockout)
-#   Date        : 2026-08-04
-#   Version     : 2.1.0-PROD
+#   Date        : 2026-08-14
+#   Version     : 2.2.1-PROD
 #   Description : Linux Server Fast Init, Performance & Dev-Sec Security Hardening
 #   Usage       : bash ./sysinit.sh
 #   Environment :
@@ -11,6 +11,15 @@
 #       HOSTNAME=myhost     自定义主机名（默认随机生成）
 #       TZ=Asia/Shanghai    时区（默认上海）
 #       SSH_PORT=22         SSH端口（默认22）
+#       SSH_ALLOW_IPS=      SSH放行源IP（逗号分隔，留空=放行所有并告警）
+#       ENABLE_SWAP=yes     创建 4G swapfile（默认 no）
+#       SWAP_SIZE=4G        swap 大小（默认 4G）
+#       ENABLE_FAIL2BAN=yes 安装并配置 fail2ban sshd jail（默认 no）
+#       DISABLE_IPV6=yes    关闭 IPv6（默认 no）
+#       ENABLE_JOURNALD=yes 配置 journald 持久化（默认 no）
+#       ENABLE_UNATTENDED=yes 启用 unattended-upgrades 安全自动更新（默认 no）
+#       ENABLE_SYSSTAT=yes  安装 sysstat/sar 系统活动采集（默认 no）
+#       CREATE_DATA_DIRS=yes 创建 /data 业务目录结构（默认 no）
 ################################################################################
 
 set -euo pipefail
@@ -31,6 +40,7 @@ declare -- __OS_ARCH__=""
 declare -- __INIT_SYSTEM__=""
 declare -- __LOG_FILE__=""
 declare -- __TMP_FILES__=""
+declare -- __INSTALL_FAILED_PKGS__=""
 
 declare -- SOURCEDIR="/data/softsrc"
 declare -- SOFTDIR="/data/software"
@@ -41,8 +51,20 @@ declare -- SOFTDIR="/data/software"
 : "${HOSTNAME:=}"
 : "${TZ:=Asia/Shanghai}"
 : "${SSH_PORT:=22}"
+: "${SSH_ALLOW_IPS:=}"
 : "${BACKUP_DIR:=/var/backups/sysinit}"
 : "${LOG_DIR:=/var/log}"
+: "${ENABLE_SWAP:=no}"
+: "${SWAP_SIZE:=4G}"
+: "${ENABLE_FAIL2BAN:=no}"
+: "${DISABLE_IPV6:=no}"
+: "${ENABLE_JOURNALD:=no}"
+: "${ENABLE_UNATTENDED:=no}"
+: "${ENABLE_SYSSTAT:=no}"
+: "${CREATE_DATA_DIRS:=no}"
+
+# 标记 yes/no 环境变量
+__ENV_YES__() { [[ "${1}" =~ ^[Yy][Ee][Ss]$ ]]; }
 
 # ==============================================================================
 # 0.0 错误处理与清理 trap
@@ -60,6 +82,9 @@ __ERR_HANDLER__() {
     __SAY__ ERROR "脚本执行异常退出 (code=${exit_code})，错误发生在: ${1:-未知位置}"
     __SAY__ ERROR "执行日志已保存至: ${__LOG_FILE__}"
     __SAY__ ERROR "配置备份目录: ${BACKUP_DIR}"
+    if [ -n "${__INSTALL_FAILED_PKGS__}" ]; then
+        __SAY__ ERROR "以下包安装失败，需手工补装: ${__INSTALL_FAILED_PKGS__}"
+    fi
     __CLEANUP_TMP__
 }
 
@@ -356,7 +381,29 @@ UTILS__PRECHECK_TOOLS__() {
 }
 
 # ==============================================================================
-# 0.11 初始化准备
+# 0.11 包安装函数（逐个安装，统计失败）
+# ==============================================================================
+# 修复 v2.1.0 的拆包失败坑：不再用引号包裹整串传给 apt-get
+# 逐包安装，失败的记入 __INSTALL_FAILED_PKGS__，不静默吞掉
+__INSTALL_PACKAGES__() {
+    local pkgs=("$@")
+    local failed=()
+    for pkg in "${pkgs[@]}"; do
+        if DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} install -y "${pkg}" >/dev/null 2>&1; then
+            __SAY__ DEBUG "已安装: ${pkg}"
+        else
+            failed+=("${pkg}")
+            __SAY__ WARN "安装失败: ${pkg}"
+        fi
+    done
+    if [ ${#failed[@]} -gt 0 ]; then
+        __INSTALL_FAILED_PKGS__="${__INSTALL_FAILED_PKGS__} ${failed[*]}"
+        __SAY__ WARN "本轮失败包（稍后汇总）: ${failed[*]}"
+    fi
+}
+
+# ==============================================================================
+# 0.12 初始化准备
 # ==============================================================================
 UTILS__DETECT_SUDO__
 UTILS__PRECHECK_TOOLS__
@@ -459,11 +506,11 @@ __BASIC_INSTALL__() {
             ;;
     esac
 
-    # 安装常用工具
+    # 安装常用工具（v2.2.0 修复：逐包安装，不再用引号包裹整串导致拆包失败）
     case "${__INSTALL_CMD__}" in
         apt-get)
-            local req_pkgs="build-essential dos2unix vim htop bash-completion make git wget curl netcat-openbsd tmux tree ca-certificates chrony sudo lsof"
-            DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} install -y "${req_pkgs}" || true
+            local req_pkgs=(build-essential dos2unix vim htop bash-completion make git wget curl netcat-openbsd tmux tree ca-certificates chrony sudo lsof)
+            __INSTALL_PACKAGES__ "${req_pkgs[@]}"
 
             # 修复 root 用户 LANG 缺失报错问题
             if [ -f "/root/.profile" ]; then
@@ -480,24 +527,56 @@ __BASIC_INSTALL__() {
             ${__SUDO__} ${__INSTALL_CMD__} groupinstall -y "Development tools" 2>/dev/null || \
                 ${__SUDO__} ${__INSTALL_CMD__} install -y gcc gcc-c++ make || true
 
-            local tools="tree dos2unix net-tools bash-completion wget vim make git tmux nmap-ncat chrony sudo lsof htop curl"
-            ${__SUDO__} ${__INSTALL_CMD__} install -y ${tools} || true
+            local tools=(tree dos2unix net-tools bash-completion wget vim make git tmux nmap-ncat chrony sudo lsof htop curl)
+            __INSTALL_PACKAGES__ "${tools[@]}"
 
             ${__SUDO__} chmod +x /etc/rc.d/rc.local 2>/dev/null || true
             ;;
         zypper)
-            local suse_tools="patterns-devel-base-devel dos2unix vim htop bash-completion make git wget curl netcat-openbsd tmux tree ca-certificates chrony sudo lsof"
-            ${__SUDO__} ${__INSTALL_CMD__} install -y ${suse_tools} || true
+            local suse_tools=(patterns-devel-base-devel dos2unix vim htop bash-completion make git wget curl netcat-openbsd tmux tree ca-certificates chrony sudo lsof)
+            __INSTALL_PACKAGES__ "${suse_tools[@]}"
             ;;
         apk)
-            local alpine_tools="build-base dos2unix vim htop bash-completion make git wget curl netcat-openbsd tmux tree ca-certificates chrony sudo lsof"
-            ${__SUDO__} ${__INSTALL_CMD__} add ${alpine_tools} || true
+            local alpine_tools=(build-base dos2unix vim htop bash-completion make git wget curl netcat-openbsd tmux tree ca-certificates chrony sudo lsof)
+            for pkg in "${alpine_tools[@]}"; do
+                ${__SUDO__} ${__INSTALL_CMD__} add "${pkg}" || true
+            done
             ;;
         pacman)
-            local arch_tools="base-devel dos2unix vim htop bash-completion make git wget curl gnu-netcat tmux tree ca-certificates chrony sudo lsof"
-            ${__SUDO__} ${__INSTALL_CMD__} -S --noconfirm ${arch_tools} || true
+            local arch_tools=(base-devel dos2unix vim htop bash-completion make git wget curl gnu-netcat tmux tree ca-certificates chrony sudo lsof)
+            for pkg in "${arch_tools[@]}"; do
+                ${__SUDO__} ${__INSTALL_CMD__} -S --noconfirm "${pkg}" || true
+            done
             ;;
     esac
+
+    # 可选：sysstat/sar 系统活动采集
+    if __ENV_YES__ "${ENABLE_SYSSTAT}"; then
+        __SAY__ INFO "安装 sysstat/sar 系统活动采集..."
+        case "${__INSTALL_CMD__}" in
+            apt-get) __INSTALL_PACKAGES__ sysstat
+                     # 启用 sar 数据采集
+                     ${__SUDO__} sed -i 's/^ENABLED="false"/ENABLED="true"/' /etc/default/sysstat 2>/dev/null || true
+                     ${__SUDO__} systemctl enable --now sysstat 2>/dev/null || true
+                     ;;
+            yum|dnf) __INSTALL_PACKAGES__ sysstat
+                     ${__SUDO__} systemctl enable --now sysstat 2>/dev/null || true
+                     ;;
+        esac
+    fi
+
+    # 可选：unattended-upgrades 自动安全更新
+    if __ENV_YES__ "${ENABLE_UNATTENDED}"; then
+        __SAY__ INFO "配置 unattended-upgrades 自动安全更新..."
+        case "${__INSTALL_CMD__}" in
+            apt-get)
+                __INSTALL_PACKAGES__ unattended-upgrades apt-listchanges
+                ${__SUDO__} systemctl enable --now unattended-upgrades 2>/dev/null || true
+                ${__SUDO__} systemctl enable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+                ;;
+        esac
+    fi
+
     __SAY__ SUCCESS "系统基础调优及工具软件安装完毕"
 }
 
@@ -522,30 +601,17 @@ __SET_SELINUX__() {
 }
 
 # ==============================================================================
-# 3.1 交互式防火墙配置
+# 3.1 防火墙配置 - ufw（唯一后端）
 # ==============================================================================
 __SET_FIREWALLD__() {
-    __SAY__ INFO "配置防火墙规则..."
-
-    # 检测当前防火墙状态
-    local fw_active=false
-    if [ "${__INIT_SYSTEM__}" = "systemd" ]; then
-        if systemctl is-active --quiet firewalld.service 2>/dev/null; then
-            fw_active=true
-            __SAY__ INFO "检测到 firewalld 正在运行"
-        fi
-        if systemctl is-active --quiet ufw.service 2>/dev/null; then
-            fw_active=true
-            __SAY__ INFO "检测到 ufw 正在运行"
-        fi
-    fi
+    __SAY__ INFO "配置防火墙规则（ufw）..."
 
     # 交互确认
     if [ -t 0 ] && [ "${AUTO_FIREWALL}" != "yes" ]; then
         echo ""
         __SAY__ INFO "========== 防火墙配置 =========="
         __SAY__ INFO "建议规则："
-        echo "  1. 默认策略: DROP（拒绝所有入站流量）"
+        echo "  1. 默认策略: deny（拒绝所有入站流量）"
         echo "  2. 放行规则:"
         echo "     - 回环接口 (lo) 全部放行"
         echo "     - 已建立连接 (ESTABLISHED,RELATED) 放行"
@@ -560,52 +626,39 @@ __SET_FIREWALLD__() {
         fi
     fi
 
-    # 禁用现有防火墙服务
-    if [ "${__INIT_SYSTEM__}" = "systemd" ]; then
-        ${__SUDO__} systemctl disable --now firewalld.service 2>/dev/null || true
-        ${__SUDO__} systemctl disable --now ufw.service 2>/dev/null || true
-    fi
-
-    # 安装 iptables
+    # 确保已安装 ufw
     case "${__INSTALL_CMD__}" in
-        apt-get)
-            DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} install -y iptables iptables-persistent || true
-            ;;
-        yum|dnf|zypper)
-            ${__SUDO__} ${__INSTALL_CMD__} install -y iptables-services iptables || true
-            ;;
-        apk)
-            ${__SUDO__} ${__INSTALL_CMD__} add iptables ip6tables || true
-            ;;
-        pacman)
-            ${__SUDO__} ${__INSTALL_CMD__} -S --noconfirm iptables || true
-            ;;
+        apt-get) DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} install -y ufw >/dev/null 2>&1 || true ;;
+        *)       ${__SUDO__} ${__INSTALL_CMD__} install -y ufw >/dev/null 2>&1 || true ;;
     esac
 
-    # 构建防火墙规则
-    local tmp_rules
-    tmp_rules=$(mktemp) || { __SAY__ ERROR "无法创建临时文件"; return 1; }
-    __REG_TMP__ "${tmp_rules}"
+    # 关闭 IPv6 规则（若 DISABLE_IPV6）
+    if __ENV_YES__ "${DISABLE_IPV6}"; then
+        ${__SUDO__} sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
+    fi
 
-    cat > "${tmp_rules}" <<'EOF'
-*filter
-:INPUT DROP [0:0]
-:FORWARD DROP [0:0]
-:OUTPUT ACCEPT [0:0]
+    # 首次启用时重置（幂等：已初始化过则保留现有规则）
+    if [ ! -f /opt/.server.init.executed ]; then
+        ${__SUDO__} ufw --force reset >/dev/null 2>&1 || true
+    fi
 
-# 回环接口放行
--A INPUT -i lo -j ACCEPT
+    # 默认策略
+    ${__SUDO__} ufw default deny incoming
+    ${__SUDO__} ufw default allow outgoing
 
-# 已建立连接放行
--A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-# ICMP 有限速率放行
--A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/second -j ACCEPT
-
-# SSH 放行
-EOF
-
-    echo "-A INPUT -p tcp --dport ${SSH_PORT} -j ACCEPT" >> "${tmp_rules}"
+    # SSH 放行（限源或全放）
+    if [ -n "${SSH_ALLOW_IPS}" ]; then
+        local IFS_BAK="${IFS}"
+        IFS=','
+        for ip in ${SSH_ALLOW_IPS}; do
+            ip=${ip//[[:space:]]/}  # 去空格
+            [ -n "${ip}" ] && ${__SUDO__} ufw allow from "${ip}" to any port "${SSH_PORT}" proto tcp
+        done
+        IFS="${IFS_BAK}"
+    else
+        __SAY__ WARN "SSH_ALLOW_IPS 未设置，SSH 放行所有来源（云安全组应限源兜底）"
+        ${__SUDO__} ufw allow "${SSH_PORT}"/tcp
+    fi
 
     # 交互添加额外 IP:端口规则
     if [ -t 0 ] && [ "${AUTO_FIREWALL}" != "yes" ]; then
@@ -615,7 +668,6 @@ EOF
             extra_port=$(__PROMPT__ "目标端口号" "")
             extra_proto=$(__PROMPT__ "协议 (tcp/udp)" "tcp")
 
-            # 输入校验
             if [ -z "${extra_port}" ]; then
                 __SAY__ WARN "端口号不能为空，跳过"
                 continue
@@ -630,51 +682,25 @@ EOF
             esac
 
             if [ -n "${extra_ip}" ]; then
-                echo "-A INPUT -p ${extra_proto} -s ${extra_ip} --dport ${extra_port} -j ACCEPT" >> "${tmp_rules}"
+                ${__SUDO__} ufw allow from "${extra_ip}" to any port "${extra_port}" proto "${extra_proto}"
                 __SAY__ INFO "添加规则: ${extra_proto} ${extra_ip}:${extra_port}"
             else
-                echo "-A INPUT -p ${extra_proto} --dport ${extra_port} -j ACCEPT" >> "${tmp_rules}"
+                ${__SUDO__} ufw allow "${extra_port}"/"${extra_proto}"
                 __SAY__ INFO "添加规则: ${extra_proto} 0.0.0.0/0:${extra_port}"
             fi
         done
     fi
 
-    # 写入日志和提交
-    cat >> "${tmp_rules}" <<'EOF'
-# 记录被拒绝的包（限速防刷）
--A INPUT -j LOG --log-prefix "FW-DROP: " --log-limit 5/minute
-COMMIT
-EOF
+    # 禁用可能冲突的 netfilter-persistent / firewalld
+    ${__SUDO__} systemctl disable --now netfilter-persistent 2>/dev/null || true
+    ${__SUDO__} systemctl disable --now firewalld 2>/dev/null || true
 
-    # 应用规则
-    ${__SUDO__} mkdir -p /etc/iptables
-    if [ -f /etc/iptables/rules.v4 ]; then
-        __BACKUP__ /etc/iptables/rules.v4
-    fi
-    ${__SUDO__} cp "${tmp_rules}" /etc/iptables/rules.v4
-    ${__SUDO__} chmod 600 /etc/iptables/rules.v4
+    # 启用 ufw
+    ${__SUDO__} ufw --force enable
+    ${__SUDO__} systemctl enable ufw 2>/dev/null || true
 
-    # 加载规则
-    if ! ${__SUDO__} iptables-restore < /etc/iptables/rules.v4 2>/dev/null; then
-        __SAY__ ERROR "iptables 规则加载失败，请检查 /etc/iptables/rules.v4 语法"
-        return 1
-    fi
-
-    # 持久化
-    case "${__INSTALL_CMD__}" in
-        apt-get)
-            DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} install -y iptables-persistent 2>/dev/null || true
-            ${__SUDO__} netfilter-persistent save 2>/dev/null || true
-            ;;
-        yum|dnf)
-            if [ "${__INIT_SYSTEM__}" = "systemd" ]; then
-                ${__SUDO__} systemctl enable iptables.service 2>/dev/null || true
-            fi
-            ${__SUDO__} service iptables save 2>/dev/null || true
-            ;;
-    esac
-
-    __SAY__ SUCCESS "防火墙规则已应用（默认 DROP，SSH ${SSH_PORT} 已放行）"
+    __SAY__ SUCCESS "ufw 防火墙已启用（默认 deny incoming，SSH ${SSH_PORT} 已放行）"
+    __SAY__ INFO "查看规则: ufw status verbose"
 }
 
 
@@ -702,7 +728,6 @@ net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_max_orphans = 3276800
-net.ipv4.tcp_mem = 94500000 915000000 927000000
 net.ipv4.ip_local_port_range = 1024 65535
 
 # --- [2] 文件句柄与系统并发范围 ---
@@ -710,7 +735,7 @@ fs.file-max = 6815744
 fs.inotify.max_user_watches = 524288
 vm.max_map_count = 655360
 
-# --- [3] Netfilter 连接跟踪提升 ---
+# --- [3] Netfilter 连接跟踪提升（需 nf_conntrack 模块）---
 net.nf_conntrack_max = 25000000
 net.netfilter.nf_conntrack_max = 25000000
 net.netfilter.nf_conntrack_tcp_timeout_established = 180
@@ -754,9 +779,13 @@ kernel.kptr_restrict = 2
 kernel.sysrq = 0
 EOF
 
+    # v2.2.0 修复：先加载 nf_conntrack 模块再 sysctl，避免 nf_conntrack_* 参数失败
+    ${__SUDO__} modprobe nf_conntrack 2>/dev/null || true
+
     __SAY__ INFO "加载内核参数..."
-    if ! ${__SUDO__} sysctl -p /etc/sysctl.d/99-zz-sysctl.conf >/dev/null 2>&1; then
-        __SAY__ WARN "部分内核参数加载失败，请检查 /etc/sysctl.d/99-zz-sysctl.conf 中的参数是否在当前内核支持范围内"
+    # v2.2.0 修复：用 -e 忽略未知 key（如某些环境无 nf_conntrack），但仍报告其他错误
+    if ! ${__SUDO__} sysctl -e -p /etc/sysctl.d/99-zz-sysctl.conf >/dev/null 2>&1; then
+        __SAY__ WARN "部分内核参数加载失败（可能是当前内核不支持），请检查 /etc/sysctl.d/99-zz-sysctl.conf"
     fi
 
     # 使用 limits.d 独立文件（幂等写入）
@@ -783,16 +812,24 @@ __SET_DEVSEC_OS_HARDEN__() {
     __SAY__ INFO "执行 Dev-Sec OS 基线专项安全加固..."
 
     # 1. 设置安全全局掩码
-    __SAY__ INFO "配置默认安全掩码 (umask 027)..."
+    # v2.2.0 改进：umask 改 022（云服务器多用户/容器场景，027 会导致容器挂载文件 403）
+    # 同时设 USERGROUPS_ENAB no（否则 Ubuntu pam_umask 仍按组机制算出 0027）
+    __SAY__ INFO "配置默认安全掩码 (umask 022)..."
     __BACKUP__ /etc/profile
-    if grep -q "umask" /etc/profile; then
-        ${__SUDO__} sed -i 's/^umask.*/umask 027/' /etc/profile
+    if grep -q "^umask" /etc/profile; then
+        ${__SUDO__} sed -i 's/^umask.*/umask 022/' /etc/profile
     else
-        echo "umask 027" | ${__SUDO__} tee -a /etc/profile >/dev/null
+        echo "umask 022" | ${__SUDO__} tee -a /etc/profile >/dev/null
     fi
     if [ -f "/etc/login.defs" ]; then
         __BACKUP__ /etc/login.defs
-        ${__SUDO__} sed -i 's/^UMASK.*/UMASK 027/' /etc/login.defs
+        ${__SUDO__} sed -i 's/^UMASK.*/UMASK 022/' /etc/login.defs
+        # USERGROUPS_ENAB no：禁用"用户私有组"机制，避免 umask 被补成 027
+        if grep -q "^USERGROUPS_ENAB" /etc/login.defs; then
+            ${__SUDO__} sed -i 's/^USERGROUPS_ENAB.*/USERGROUPS_ENAB no/' /etc/login.defs
+        else
+            echo "USERGROUPS_ENAB no" | ${__SUDO__} tee -a /etc/login.defs >/dev/null
+        fi
     fi
 
     # 2. 口令安全策略强化
@@ -842,6 +879,18 @@ __SET_TIMEZONE__() {
             ${__SUDO__} systemctl enable --now chrony.service 2>/dev/null || true
         fi
     fi
+
+    # v2.2.0 新增：云环境优化 NTP 源（阿里云内网 ntp.aliyun.com）
+    if [ "${SERVER_TYPE}" = "cloud" ] && [ -f /etc/chrony/chrony.conf ]; then
+        __SAY__ INFO "检测到云环境，优化 chrony NTP 源..."
+        __BACKUP__ /etc/chrony/chrony.conf
+        # 在首行追加阿里云 NTP（不影响原有 pool）
+        if ! grep -q "ntp.aliyun.com" /etc/chrony/chrony.conf 2>/dev/null; then
+            ${__SUDO__} sed -i '1i server ntp.aliyun.com iburst' /etc/chrony/chrony.conf
+        fi
+        ${__SUDO__} systemctl restart chronyd.service 2>/dev/null || \
+        ${__SUDO__} systemctl restart chrony.service 2>/dev/null || true
+    fi
 }
 
 __SET_CMDAUDIT__() {
@@ -854,7 +903,9 @@ __SET_CMDAUDIT__() {
     ${__SUDO__} mkdir -p "${audit_dir}"
     if [ ! -f "${audit_file}" ]; then
         ${__SUDO__} touch "${audit_file}"
-        ${__SUDO__} chmod 600 "${audit_file}"
+        # v2.2.0 修复：权限改 666（非 root 用户 PROMPT_COMMAND 也要写）
+        # 保留 chattr +a 防篡改（只追加不可删改），但放开所有用户追加写
+        ${__SUDO__} chmod 666 "${audit_file}"
         if UTILS__CMD_EXISTS__ chattr; then
             ${__SUDO__} chattr +a "${audit_file}" 2>/dev/null || true
         fi
@@ -870,7 +921,8 @@ __AUDIT_INIT__() {
     fi
     if [ ! -f "${COMMANDAUDIT_FILE}" ]; then
         touch "${COMMANDAUDIT_FILE}" 2>/dev/null
-        chmod 600 "${COMMANDAUDIT_FILE}" 2>/dev/null
+        # v2.2.0: 666 让非 root 用户也能写，chattr +a 防篡改
+        chmod 666 "${COMMANDAUDIT_FILE}" 2>/dev/null
         if command -v chattr >/dev/null 2>&1; then
             chattr +a "${COMMANDAUDIT_FILE}" 2>/dev/null || true
         fi
@@ -882,9 +934,8 @@ if [ "${1:-}" = "cron" ]; then
     exit 0
 fi
 
-if [ $(id -u) -eq 0 ]; then
-    __AUDIT_INIT__
-fi
+# 所有用户都初始化（非仅 root），因为审计文件现在 666
+__AUDIT_INIT__
 
 export HISTSIZE=1000
 export HISTFILESIZE=1500
@@ -893,6 +944,9 @@ export PROMPT_COMMAND='{ date "+%T ### [$(whoami)] ### $(who am i |awk "{print \
 AUDITEOF
 
     ${__SUDO__} chmod +x /etc/profile.d/cmdAudit.sh
+
+    # v2.2.0 修复：审计目录设 sticky + others wx（用户可创建/追加自己的日志但不能列出他人文件）
+    ${__SUDO__} chmod 1733 "${audit_dir}" 2>/dev/null || true
 
     # 使用 cron.d 独立文件替代 /etc/crontab
     if [ ! -f /etc/cron.d/cmdAudit ]; then
@@ -912,7 +966,7 @@ CRONEOF
     delaycompress
     missingok
     notifempty
-    create 600 root root
+    create 666 root root
     sharedscripts
     postrotate
         /usr/bin/find /var/log/cmdAudit/ -name "*.log" -mtime +90 -delete
@@ -921,7 +975,7 @@ CRONEOF
 LOGROTEOF
     ${__SUDO__} chmod 644 /etc/logrotate.d/cmdAudit
 
-    __SAY__ SUCCESS "命令审计日志已配置（权限 600，logrotate 已设置）"
+    __SAY__ SUCCESS "命令审计日志已配置（权限 666+chattr +a，logrotate 已设置）"
 }
 
 __SET_DISABLE_SERVICES__() {
@@ -964,8 +1018,8 @@ __SET_SSHD_CONFIG__() {
         echo "  6. 禁用 GSSAPI 认证 (GSSAPIAuthentication no)"
         echo "  7. 禁用 DNS 反向解析 (UseDNS no)"
         echo "  8. 客户端保活检测 (ClientAliveInterval 300, ClientAliveCountMax 3)"
+        echo "  9. 登录宽限期 (LoginGraceTime 60)"
         echo ""
-
         if ! __CONFIRM__ "是否应用 SSH 安全加固配置？" "y"; then
             __SAY__ WARN "用户跳过 SSH 加固配置"
             return 0
@@ -986,10 +1040,16 @@ __SET_SSHD_CONFIG__() {
         ["PermitEmptyPasswords"]="no"
         ["X11Forwarding"]="no"
         ["MaxAuthTries"]="4"
+        ["LoginGraceTime"]="60"
         ["ClientAliveInterval"]="300"
         ["ClientAliveCountMax"]="3"
         ["Protocol"]="2"
     )
+
+    # v2.2.0 新增：DISABLE_IPV6 时设 AddressFamily inet
+    if __ENV_YES__ "${DISABLE_IPV6}"; then
+        ssh_params["AddressFamily"]="inet"
+    fi
 
     # 交互式 SSH 额外配置
     if [ -t 0 ] && [ "${AUTO_SSH}" != "yes" ]; then
@@ -1014,6 +1074,21 @@ __SET_SSHD_CONFIG__() {
         fi
     done
 
+    # v2.2.0 新增：修正 sshd_config.d/*.conf 中的 PasswordAuthentication yes 覆盖
+    # 坑：sshd "首值生效"机制，cloud-init drop-in 先于主配置读取 → 主配置改了无效
+    if [ -d /etc/ssh/sshd_config.d ]; then
+        __SAY__ INFO "检查 sshd_config.d/*.conf 中的密码认证覆盖..."
+        local dropin
+        for dropin in /etc/ssh/sshd_config.d/*.conf; do
+            [ -f "${dropin}" ] || continue
+            if grep -qiE "^\s*PasswordAuthentication\s+yes" "${dropin}" 2>/dev/null; then
+                __BACKUP__ "${dropin}"
+                ${__SUDO__} sed -i 's/^\(\s*PasswordAuthentication\s*\)yes/\1no/I' "${dropin}"
+                __SAY__ INFO "已修正 ${dropin} 中的 PasswordAuthentication yes -> no"
+            fi
+        done
+    fi
+
     # --- [Anti-Lockout 步骤 2: 语法合规性检查与安全重载] ---
     __SAY__ INFO "验证 SSHD 语法完整性 (sshd -t)..."
     if ${__SUDO__} sshd -t 2>/dev/null; then
@@ -1037,6 +1112,160 @@ __SET_SSHD_CONFIG__() {
 
 
 # ==============================================================================
+# 7.1 可选：关闭 IPv6
+# ==============================================================================
+__SET_DISABLE_IPV6__() {
+    if ! __ENV_YES__ "${DISABLE_IPV6}"; then
+        return 0
+    fi
+    __SAY__ INFO "关闭 IPv6..."
+
+    ${__SUDO__} tee /etc/sysctl.d/99-disable-ipv6.conf >/dev/null <<'EOF'
+# Disable IPv6
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+    ${__SUDO__} sysctl -e -p /etc/sysctl.d/99-disable-ipv6.conf >/dev/null 2>&1 || true
+
+    # ufw 关闭 IPv6 规则
+    if [ -f /etc/default/ufw ]; then
+        ${__SUDO__} sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
+    fi
+
+    # nginx 去 [::] 监听（若已装）
+    if [ -f /etc/nginx/sites-enabled/default ]; then
+        __BACKUP__ /etc/nginx/sites-enabled/default
+        ${__SUDO__} sed -i 's/^\(\s*listen \[::\]:.*\)/#\1/' /etc/nginx/sites-enabled/default 2>/dev/null || true
+    fi
+
+    __SAY__ SUCCESS "IPv6 已关闭（sysctl + ufw IPV6=no + sshd AddressFamily inet 已在 SSH 模块设置）"
+}
+
+
+# ==============================================================================
+# 7.2 可选：swap 配置
+# ==============================================================================
+__SET_SWAP__() {
+    if ! __ENV_YES__ "${ENABLE_SWAP}"; then
+        return 0
+    fi
+    __SAY__ INFO "配置 ${SWAP_SIZE} swapfile..."
+
+    local swapfile="/swapfile"
+    # 已存在则跳过
+    if ${__SUDO__} swapon --show 2>/dev/null | grep -q "${swapfile}"; then
+        __SAY__ INFO "swap ${swapfile} 已存在，跳过"
+        return 0
+    fi
+
+    ${__SUDO__} fallocate -l "${SWAP_SIZE}" "${swapfile}" 2>/dev/null || {
+        # fallocate 不支持时用 dd（bs=1M，count 为 MiB 数）
+        __SAY__ INFO "fallocate 失败，使用 dd..."
+        local swap_mib
+        swap_mib=$(numfmt --from=iec "${SWAP_SIZE}" 2>/dev/null || echo 4096)
+        swap_mib=$(( swap_mib / 1024 / 1024 ))
+        [ "${swap_mib}" -lt 1 ] && swap_mib=4096
+        ${__SUDO__} dd if=/dev/zero of="${swapfile}" bs=1M count="${swap_mib}" status=progress
+    }
+    ${__SUDO__} chmod 600 "${swapfile}"
+    ${__SUDO__} mkswap "${swapfile}"
+    ${__SUDO__} swapon "${swapfile}"
+
+    # fstab 持久化
+    if ! grep -q "${swapfile}" /etc/fstab 2>/dev/null; then
+        echo "${swapfile} none swap sw 0 0" | ${__SUDO__} tee -a /etc/fstab >/dev/null
+    fi
+
+    __SAY__ SUCCESS "swap ${SWAP_SIZE} 已配置并启用（fstab 持久化）"
+}
+
+
+# ==============================================================================
+# 7.3 可选：fail2ban
+# ==============================================================================
+__SET_FAIL2BAN__() {
+    if ! __ENV_YES__ "${ENABLE_FAIL2BAN}"; then
+        return 0
+    fi
+    __SAY__ INFO "安装并配置 fail2ban..."
+
+    case "${__INSTALL_CMD__}" in
+        apt-get) __INSTALL_PACKAGES__ fail2ban ;;
+        yum|dnf) __INSTALL_PACKAGES__ fail2ban ;;
+        *) __SAY__ WARN "fail2ban 在当前系统包管理器下可能不可用，跳过"; return 0 ;;
+    esac
+
+    # sshd jail 本地配置（jail.local 覆盖默认）
+    ${__SUDO__} tee /etc/fail2ban/jail.local >/dev/null <<'EOF'
+[sshd]
+enabled = true
+port = ${SSH_PORT}
+filter = sshd
+logpath = %(sshd_log)s
+backend = systemd
+maxretry = 5
+findtime = 600
+bantime = 3600
+EOF
+    # 替换 SSH_PORT 占位（jail.local 不支持变量，需实际值）
+    ${__SUDO__} sed -i "s/\${SSH_PORT}/${SSH_PORT}/" /etc/fail2ban/jail.local 2>/dev/null || true
+
+    ${__SUDO__} systemctl enable --now fail2ban 2>/dev/null || true
+
+    __SAY__ SUCCESS "fail2ban 已启用（sshd jail: maxretry=5 bantime=1h）"
+}
+
+
+# ==============================================================================
+# 7.4 可选：journald 持久化
+# ==============================================================================
+__SET_JOURNALD__() {
+    if ! __ENV_YES__ "${ENABLE_JOURNALD}"; then
+        return 0
+    fi
+    __SAY__ INFO "配置 journald 持久化..."
+
+    ${__SUDO__} mkdir -p /etc/systemd/journald.conf.d
+    ${__SUDO__} tee /etc/systemd/journald.conf.d/sysinit.conf >/dev/null <<'EOF'
+# sysinit journald 持久化配置
+Storage=persistent
+SystemMaxUse=256M
+MaxRetentionSec=30day
+EOF
+
+    # 创建持久化目录
+    ${__SUDO__} mkdir -p /var/log/journal
+    ${__SUDO__} systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+
+    ${__SUDO__} systemctl restart systemd-journald 2>/dev/null || true
+
+    __SAY__ SUCCESS "journald 持久化已配置（256M/30天）"
+}
+
+
+# ==============================================================================
+# 7.5 可选：创建 /data 业务目录结构
+# ==============================================================================
+__SET_DATA_DIRS__() {
+    if ! __ENV_YES__ "${CREATE_DATA_DIRS}"; then
+        return 0
+    fi
+    __SAY__ INFO "创建 /data 业务目录结构..."
+
+    ${__SUDO__} mkdir -p /data/apps /data/scripts /data/backups /data/nginx-sites /data/creds
+    # /data 根 0755
+    ${__SUDO__} chmod 0755 /data
+    # creds 目录 755（nginx 需读 htpasswd 等文件，文件自身 600）
+    ${__SUDO__} chmod 0755 /data/creds
+    # 其余子目录默认 755
+    ${__SUDO__} chmod 0755 /data/apps /data/scripts /data/backups /data/nginx-sites
+
+    __SAY__ SUCCESS "/data 业务目录已创建（apps/scripts/backups/nginx-sites/creds）"
+}
+
+
+# ==============================================================================
 # 8. 执行主干与报告检查
 # ==============================================================================
 __MAIN__() {
@@ -1049,6 +1278,7 @@ __MAIN__() {
     __SAY__ INFO "============= 正在运行 Linux 服务器快速安全优化初始化脚本 ============="
     __SAY__ INFO "执行日志: ${__LOG_FILE__}"
     __SAY__ INFO "配置备份目录: ${BACKUP_DIR}"
+    __SAY__ INFO "可选模块: SWAP=${ENABLE_SWAP} FAIL2BAN=${ENABLE_FAIL2BAN} IPV6_OFF=${DISABLE_IPV6} JOURNALD=${ENABLE_JOURNALD} UNATTENDED=${ENABLE_UNATTENDED} SYSSTAT=${ENABLE_SYSSTAT} DATA_DIRS=${CREATE_DATA_DIRS}"
     __PRECHECK__
     __SET_HOSTNAME__
     __SET_SOURCEREPO__
@@ -1061,6 +1291,11 @@ __MAIN__() {
     __SET_CMDAUDIT__
     __SET_DISABLE_SERVICES__
     __SET_SSHD_CONFIG__
+    __SET_DISABLE_IPV6__
+    __SET_SWAP__
+    __SET_FAIL2BAN__
+    __SET_JOURNALD__
+    __SET_DATA_DIRS__
 
     # 所有步骤成功后写入初始化标记
     ${__SUDO__} mkdir -p /opt
@@ -1071,6 +1306,9 @@ EOF
     __SAY__ SUCCESS "================ 优化结束！系统安全基线已全面加固 =================="
     __SAY__ INFO "执行日志已保存: ${__LOG_FILE__}"
     __SAY__ INFO "配置备份目录: ${BACKUP_DIR}"
+    if [ -n "${__INSTALL_FAILED_PKGS__}" ]; then
+        __SAY__ WARN "以下包安装失败，需手工补装: ${__INSTALL_FAILED_PKGS__}"
+    fi
     __SAY__ INFO "新内核参数配置与登录策略调整建议在适当时机重启服务器 (reboot) 后以取得最深度的优化支持。"
 
     __CLEANUP_TMP__

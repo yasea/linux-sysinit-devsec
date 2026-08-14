@@ -6,22 +6,29 @@ Linux 服务器快速初始化、性能调优与 Dev-Sec 安全基线加固脚�
 
 一键完成新装 Linux 服务器的以下工作：
 
-| 模块 | 功能 | 交互 |
-|------|------|------|
-| 系统检测 | 自动识别 OS 发行版、包管理器、云环境、Init 系统 | — |
-| 主机名设置 | 自定义或随机生成主机名，同步 `/etc/hosts` | 环境变量 `HOSTNAME` |
-| 软件源检查 | 云环境保持厂商源，本地环境提示 | — |
-| 基础工具安装 | 安装 vim/git/curl/chrony/htop 等常用工具 | — |
-| 系统安全更新 | 可选执行全系统升级 | ✅ 交互确认 |
-| SELinux | RHEL 系设为 Permissive 模式 | — |
-| **防火墙** | iptables 默认 DROP + 自定义 IP:端口白名单 | ✅ **交互式配置** |
-| 内核优化 | 高并发网络参数 + 安全基线（ASLR、rp_filter 等） | — |
-| 文件句柄 | limits.d 独立文件，幂等写入 | — |
-| OS 加固 | umask 027、密码策略、锁定系统账户、凭证文件权限 | — |
-| 时区设置 | 可配置时区（默认 Asia/Shanghai） | 环境变量 `TZ` |
-| 命令审计 | PROMPT_COMMAND 审计 + logrotate 轮转 | — |
-| 禁用服务 | 关闭 postfix/rpcbind/exim4 等非必要服务 | — |
-| **SSH 加固** | 禁用 root 密码登录、密钥认证、防锁死回滚 | ✅ **交互式配置** |
+| 模块 | 功能 | 交互 | 开关 |
+|------|------|------|------|
+| 系统检测 | 自动识别 OS 发行版、包管理器、云环境、Init 系统 | — | — |
+| 主机名设置 | 自定义或随机生成主机名，同步 `/etc/hosts` | — | `HOSTNAME` |
+| 软件源检查 | 云环境保持厂商源，本地环境提示 | — | — |
+| 基础工具安装 | 逐包安装 vim/git/curl/chrony/htop 等（失败汇总） | — | — |
+| 系统安全更新 | 可选执行全系统升级 | ✅ 交互确认 | — |
+| SELinux | RHEL 系设为 Permissive 模式 | — | — |
+| **防火墙** | ufw 默认 deny incoming，SSH 限源 | ✅ **交互式配置** | `SSH_ALLOW_IPS` |
+| 内核优化 | 高并发网络参数 + 安全基线（ASLR、rp_filter 等） | — | — |
+| 文件句柄 | limits.d 独立文件，幂等写入 | — | — |
+| OS 加固 | umask 022 + USERGROUPS_ENAB no、密码策略、锁定系统账户、凭证文件权限 | — | — |
+| 时区设置 | 可配置时区（默认 Asia/Shanghai），云环境优化 NTP 源 | — | `TZ` |
+| 命令审计 | PROMPT_COMMAND 审计 + logrotate 轮转（666+chattr +a） | — | — |
+| 禁用服务 | 关闭 postfix/rpcbind/exim4 等非必要服务 | — | — |
+| **SSH 加固** | 禁用 root 密码登录、密钥认证、防锁死回滚、修正 cloud-init 覆盖 | ✅ **交互式配置** | — |
+| **swap** | 4G swapfile + fstab 持久化 | — | `ENABLE_SWAP` |
+| **fail2ban** | sshd jail 安装与配置 | — | `ENABLE_FAIL2BAN` |
+| **关闭 IPv6** | sysctl + ufw + sshd + nginx 全链路关闭 | — | `DISABLE_IPV6` |
+| **journald** | 持久化 256M/30天 | — | `ENABLE_JOURNALD` |
+| **unattended** | 自动安全更新 | — | `ENABLE_UNATTENDED` |
+| **sysstat** | sar 系统活动采集 | — | `ENABLE_SYSSTAT` |
+| **/data 目录** | 创建 apps/scripts/backups/nginx-sites/creds 标准结构 | — | `CREATE_DATA_DIRS` |
 
 ## 支持的操作系统
 
@@ -59,6 +66,15 @@ AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 | `HOSTNAME` | (随机生成) | 自定义主机名 |
 | `TZ` | `Asia/Shanghai` | 系统时区 |
 | `SSH_PORT` | `22` | SSH 服务端口（防火墙放行此端口） |
+| `SSH_ALLOW_IPS` | (空) | SSH 放行源 IP，逗号分隔（如 `1.2.3.4,5.6.7.8`）。留空=放行所有并告警 |
+| `ENABLE_SWAP` | `no` | 设为 `yes` 创建 4G swapfile |
+| `SWAP_SIZE` | `4G` | swap 大小（如 `4G`/`8G`） |
+| `ENABLE_FAIL2BAN` | `no` | 设为 `yes` 安装并配置 fail2ban sshd jail |
+| `DISABLE_IPV6` | `no` | 设为 `yes` 关闭 IPv6（sysctl+ufw+sshd+nginx） |
+| `ENABLE_JOURNALD` | `no` | 设为 `yes` 配置 journald 持久化（256M/30天） |
+| `ENABLE_UNATTENDED` | `no` | 设为 `yes` 启用 unattended-upgrades 自动安全更新 |
+| `ENABLE_SYSSTAT` | `no` | 设为 `yes` 安装 sysstat/sar |
+| `CREATE_DATA_DIRS` | `no` | 设为 `yes` 创建 `/data` 业务目录结构 |
 | `BACKUP_DIR` | `/var/backups/sysinit` | 配置文件修改备份目录 |
 | `LOG_DIR` | `/var/log` | 执行日志保存目录 |
 | `LOG_LEVEL` | `INFO` | 日志级别：`INFO` / `WARN` / `ERROR` / `DEBUG` |
@@ -66,11 +82,18 @@ AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 ### 示例
 
 ```bash
-# 自定义主机名和时区，非交互模式
-HOSTNAME=web-prod-01 TZ=Asia/Shanghai AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
+# 全自动（推荐云服务器开箱即用）
+HOSTNAME=myhost TZ=Asia/Shanghai SSH_ALLOW_IPS=1.2.3.4 \
+ENABLE_SWAP=yes ENABLE_FAIL2BAN=yes DISABLE_IPV6=yes \
+ENABLE_JOURNALD=yes ENABLE_UNATTENDED=yes ENABLE_SYSSTAT=yes \
+CREATE_DATA_DIRS=yes \
+AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 
-# 自定义 SSH 端口
-SSH_PORT=2222 bash sysinit.sh
+# 自定义 SSH 端口 + SSH 限源
+SSH_PORT=2222 SSH_ALLOW_IPS=10.0.0.0/8 bash sysinit.sh
+
+# 最小化（仅基础加固，不加可选模块）
+AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 ```
 
 ## 交互式配置说明
@@ -81,10 +104,10 @@ SSH_PORT=2222 bash sysinit.sh
 
 1. **确认是否启用防火墙** — 默认推荐启用
 2. **自动应用基础规则**：
-   - 默认策略: `DROP`（拒绝所有入站）
+   - 默认策略: DROP/deny（拒绝所有入站）
    - 回环接口 (`lo`) 全部放行
    - 已建立连接 (`ESTABLISHED,RELATED`) 放行
-   - SSH 端口放行（默认 22，可通过 `SSH_PORT` 修改）
+   - SSH 端口放行（默认 22，可通过 `SSH_PORT` 修改；`SSH_ALLOW_IPS` 限源）
    - ICMP ping 有限速率放行
 3. **自定义 IP:端口规则** — 循环添加，支持：
    - 指定源 IP（留空表示所有来源）
@@ -101,21 +124,25 @@ SSH_PORT=2222 bash sysinit.sh
 4. **自动应用安全参数**：
    - `UseDNS no`、`GSSAPIAuthentication no`
    - `PermitEmptyPasswords no`、`X11Forwarding no`
-   - `MaxAuthTries 4`、`ClientAliveInterval 300`
-5. **防锁死机制**：
+   - `MaxAuthTries 4`、`LoginGraceTime 60`、`ClientAliveInterval 300`
+   - `AddressFamily inet`（`DISABLE_IPV6=yes` 时）
+5. **修正 cloud-init 覆盖**：检测 `sshd_config.d/*.conf` 中的 `PasswordAuthentication yes` 并修正（sshd 首值生效机制坑）
+6. **防锁死机制**：
    - 修改前自动备份配置
    - `sshd -t` 语法校验
    - 校验失败自动回滚备份，防止远程断连
 
 ## 安全注意事项
 
-1. **防火墙默认 DROP**：应用后确保你已放行 SSH 端口，否则会失去远程连接。
+1. **防火墙默认 deny/drop**：应用后确保你已放行 SSH 端口，否则会失去远程连接。建议设置 `SSH_ALLOW_IPS` 限源。
 2. **SSH 密钥认证**：启用 `PasswordAuthentication no` 前，请确认已配置 SSH 公钥。
-3. **SELinux Permissive**：脚本将 SELinux 设为 permissive 模式，生产环境建议后续按需调整为 enforcing。
-4. **备份机制**：所有 `/etc` 下的修改会备份到 `BACKUP_DIR`（默认 `/var/backups/sysinit/`）。
-5. **执行日志**：运行日志自动保存到 `LOG_DIR/sysinit-<时间戳>.log`（默认 `/var/log/`），便于审计与排错。
-6. **幂等性**：脚本执行成功后会在 `/opt/.server.init.executed` 写入标记，如需重新执行请删除此文件或确认覆盖提示。
-7. **错误处理**：脚本启用 `set -euo pipefail` 与 ERR trap，任何步骤失败都会输出错误位置、日志路径与备份路径后退出。
+3. **umask 022**：v2.2.0 起改为 022（云服务器多用户/容器场景；027 会导致容器挂载文件 403）。同时设 `USERGROUPS_ENAB no`。
+4. **命令审计权限**：v2.2.0 起审计文件 666 + `chattr +a`（非 root 用户可写追加，不可删改）。
+5. **SELinux Permissive**：脚本将 SELinux 设为 permissive 模式，生产环境建议后续按需调整为 enforcing。
+6. **备份机制**：所有 `/etc` 下的修改会备份到 `BACKUP_DIR`（默认 `/var/backups/sysinit/`）。
+7. **执行日志**：运行日志自动保存到 `LOG_DIR/sysinit-<时间戳>.log`（默认 `/var/log/`），便于审计与排错。
+8. **幂等性**：脚本执行成功后会在 `/opt/.server.init.executed` 写入标记，如需重新执行请删除此文件或确认覆盖提示。
+9. **错误处理**：脚本启用 `set -euo pipefail` 与 ERR trap，任何步骤失败都会输出错误位置、日志路径与备份路径后退出。安装失败的包会在末尾汇总告警。
 
 ## 文件结构
 
@@ -129,6 +156,8 @@ SSH_PORT=2222 bash sysinit.sh
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| 2.2.0 | 2026-08-14 | P0 修复：apt 拆包失败、iptables LOG 语法、umask 027→022+USERGROUPS_ENAB、防火墙改 ufw；P1 增强：SSH 补 LoginGraceTime/AddressFamily/cloud-init 修正、审计权限 666、新增 swap/fail2ban/IPv6/journald/unattended/sysstat/data目录/deploy账号可选模块；P2：SSH 限源、nf_conntrack modprobe、云环境 NTP 优化、错误汇总 |
+| 2.2.1 | 2026-08-14 | 防火墙统一为 ufw（移除 iptables 后端）；修复 swap dd 回退单位错误、ufw reset 幂等性；移除 deploy 部署账号模块 |
 | 2.1.0 | 2026-08-04 | 交互式防火墙/SSH、兼容性增强、P0 缺陷修复、日志与备份完善 |
 | 2.0.0 | 2026-08-04 | Dev-Sec 安全基线 + Anti-Lockout SSH 回滚 |
 | 1.0.0 | — | 初始版本 |
