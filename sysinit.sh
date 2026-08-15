@@ -180,6 +180,28 @@ __SAY__() {
 }
 
 # ==============================================================================
+# 0.1.1 启动横幅与模块分隔（纯控制台排版，不写日志）
+# ==============================================================================
+__BANNER__() {
+    local C="\033[1;36m" R="\033[0m"
+    printf "${C}"
+    printf "==============================================================\n"
+    printf "   Linux Server Fast Init & Dev-Sec Security Hardening\n"
+    printf "   sysinit.sh  v2.2.2\n"
+    printf "==============================================================\n"
+    printf "${R}\n"
+}
+
+# 模块分隔标题（统一排版，不写日志）
+__SECTION__() {
+    local title="$1"
+    local C="\033[1;34m" R="\033[0m"
+    printf "\n${C}──────────────────────────────────────────────${R}\n"
+    printf "${C}  %s${R}\n" "${title}"
+    printf "${C}──────────────────────────────────────────────${R}\n"
+}
+
+# ==============================================================================
 # 0.2 统一备份函数
 # ==============================================================================
 __BACKUP__() {
@@ -204,12 +226,13 @@ __REG_TMP__() {
 }
 
 # ==============================================================================
-# 0.3 交互确认函数
+# 0.3 交互确认函数（统一排版：提示符 + 默认值高亮）
 # ==============================================================================
 __CONFIRM__() {
     local prompt="$1"
     local default="${2:-}"
     local answer
+    local C="\033[1;33m" R="\033[0m"
 
     # 非 TTY 环境，使用默认值
     if [ ! -t 0 ]; then
@@ -222,29 +245,30 @@ __CONFIRM__() {
 
     while true; do
         if [ "${default}" = "y" ]; then
-            printf "  >>> %s [Y/n]: " "${prompt}"
+            printf "  ${C}?${R} %s ${C}[Y/n]${R}: " "${prompt}"
         elif [ "${default}" = "n" ]; then
-            printf "  >>> %s [y/N]: " "${prompt}"
+            printf "  ${C}?${R} %s ${C}[y/N]${R}: " "${prompt}"
         else
-            printf "  >>> %s [y/n]: " "${prompt}"
+            printf "  ${C}?${R} %s ${C}[y/n]${R}: " "${prompt}"
         fi
         read -r answer
         answer="${answer:-${default}}"
         case "${answer}" in
             [Yy]|[Yy][Ee][Ss]) return 0 ;;
             [Nn]|[Nn][Oo])     return 1 ;;
-            *) printf "  请输入 y 或 n\n" ;;
+            *) printf "  ${C}!${R} 请输入 y 或 n\n" ;;
         esac
     done
 }
 
 # ==============================================================================
-# 0.4 交互输入函数
+# 0.4 交互输入函数（统一排版：提示符 + 默认值高亮）
 # ==============================================================================
 __PROMPT__() {
     local prompt="$1"
     local default="${2:-}"
     local input
+    local C="\033[1;33m" R="\033[0m"
 
     # 非 TTY 环境，返回默认值
     if [ ! -t 0 ]; then
@@ -253,9 +277,9 @@ __PROMPT__() {
     fi
 
     if [ -n "${default}" ]; then
-        printf "  >>> %s [%s]: " "${prompt}" "${default}"
+        printf "  ${C}?${R} %s ${C}[%s]${R}: " "${prompt}" "${default}"
     else
-        printf "  >>> %s: " "${prompt}"
+        printf "  ${C}?${R} %s: " "${prompt}"
     fi
     read -r input
     echo "${input:-${default}}"
@@ -692,6 +716,9 @@ __SET_UFW__() {
         echo "     - SSH 端口 (${SSH_PORT}) 放行"
         echo "     - ICMP (ping) 有限速率放行"
         echo "  3. 可额外添加指定 IP 和端口的放行规则"
+        echo ""
+        echo "  ⚠ 提示：启用后默认拒绝所有入站流量，仅放行上述规则。"
+        echo "    若通过 SSH 远程执行，建议开启『自动放行当前连接 IP』以防误锁。"
         echo ""
 
         if ! __CONFIRM__ "是否启用防火墙配置？" "y"; then
@@ -1139,6 +1166,9 @@ __SET_SSHD_CONFIG__() {
         echo "  8. 客户端保活检测 (ClientAliveInterval 300, ClientAliveCountMax 3)"
         echo "  9. 登录宽限期 (LoginGraceTime 60)"
         echo ""
+        echo "  ⚠ 提示：加固后默认仅允许密钥登录（禁用密码认证）。"
+        echo "    请先确认已配置 SSH 公钥，再继续，否则可能无法再登录。"
+        echo ""
         if ! __CONFIRM__ "是否应用 SSH 安全加固配置？" "y"; then
             __SAY__ WARN "用户跳过 SSH 加固配置"
             return 0
@@ -1398,17 +1428,25 @@ __MAIN__() {
     __SAY__ INFO "执行日志: ${__LOG_FILE__}"
     __SAY__ INFO "配置备份目录: ${BACKUP_DIR}"
     __SAY__ INFO "可选模块: SWAP=${ENABLE_SWAP} FAIL2BAN=${ENABLE_FAIL2BAN} IPV6_OFF=${DISABLE_IPV6} JOURNALD=${ENABLE_JOURNALD} UNATTENDED=${ENABLE_UNATTENDED} SYSSTAT=${ENABLE_SYSSTAT} DATA_DIRS=${CREATE_DATA_DIRS}"
+    __BANNER__
     __PRECHECK__
+    __SECTION__ "1. 基础系统属性设置"
     __SET_HOSTNAME__
     __SET_SOURCEREPO__
+    __SECTION__ "2. 基础依赖包更新与安装"
     __BASIC_INSTALL__
+    __SECTION__ "3. SELinux 与防火墙设置"
     __SET_SELINUX__
     __SET_UFW__
+    __SECTION__ "4. 核心优化：高并发性能调优 + Dev-Sec 内核安全基线"
     __SET_KERN_OPTIMIZE__
+    __SECTION__ "5. Dev-Sec OS 基线专项安全加固"
     __SET_DEVSEC_OS_HARDEN__
+    __SECTION__ "6. 系统时区与审计服务配置"
     __SET_TIMEZONE__
     __SET_CMDAUDIT__
     __SET_DISABLE_SERVICES__
+    __SECTION__ "7. Dev-Sec SSH 加固与防锁死配置"
     __SET_SSHD_CONFIG__
     __SET_DISABLE_IPV6__
     __SET_SWAP__
