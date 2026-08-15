@@ -708,10 +708,10 @@ __SET_UFW__() {
         __DISABLE_UFW_IPV6__
     fi
 
-    # 首次启用时重置（幂等：已初始化过则保留现有规则）
-    if [ ! -f /opt/.server.init.executed ]; then
-        ${__SUDO__} ufw --force reset >/dev/null 2>&1 || true
-    fi
+    # 每次执行都重置并重建（保证幂等，避免旧规则叠加）
+    # ufw reset 会清空规则并恢复默认 allow 策略（不会锁死），随后脚本重建 deny 策略与规则
+    __SAY__ INFO "重置 ufw 规则（保证幂等，重建干净规则集）..."
+    ${__SUDO__} ufw --force reset >/dev/null 2>&1 || true
 
     # 默认策略
     ${__SUDO__} ufw default deny incoming
