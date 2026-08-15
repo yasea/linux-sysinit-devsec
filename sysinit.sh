@@ -2,7 +2,7 @@
 ################################################################################
 #   Author      : 0x5c0f (Enhanced with Dev-Sec Baseline & Anti-Lockout)
 #   Date        : 2026-08-14
-#   Version     : 2.2.1-PROD
+#   Version     : 2.2.2-PROD
 #   Description : Linux Server Fast Init, Performance & Dev-Sec Security Hardening
 #   Usage       : bash ./sysinit.sh
 #   Environment :
@@ -12,6 +12,7 @@
 #       TZ=Asia/Shanghai    时区（默认上海）
 #       SSH_PORT=22         SSH端口（默认22）
 #       SSH_ALLOW_IPS=      SSH放行源IP（逗号分隔，留空=放行所有并告警）
+#       AUTO_WHITELIST_CURRENT_IP=yes  非交互且 AUTO_FIREWALL=yes 时自动将当前连接IP加入SSH白名单（默认yes）
 #       ENABLE_SWAP=yes     创建 4G swapfile（默认 no）
 #       SWAP_SIZE=4G        swap 大小（默认 4G）
 #       ENABLE_FAIL2BAN=yes 安装并配置 fail2ban sshd jail（默认 no）
@@ -27,10 +28,41 @@ set -euo pipefail
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
 export PATH
 
+# bash 版本检查（依赖关联数组 local -A，需 bash >= 4）
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    echo "错误: 本脚本需要 bash >= 4（当前 ${BASH_VERSION}）" >&2
+    exit 1
+fi
+
+# 用法帮助
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<'USAGE'
+用法: bash sysinit.sh [--help]
+
+一键完成 Linux 服务器初始化与 Dev-Sec 安全基线加固。
+
+常用环境变量:
+  AUTO_FIREWALL=yes        非交互防火墙（默认推荐规则）
+  AUTO_SSH=yes             非交互 SSH 加固（默认推荐配置）
+  HOSTNAME=myhost          自定义主机名（默认随机）
+  SSH_PORT=22              SSH 端口（防火墙放行此端口）
+  SSH_ALLOW_IPS=           SSH 放行源 IP（逗号分隔；留空=自动白名单当前 IP 或全放+告警）
+  AUTO_WHITELIST_CURRENT_IP=yes  非交互且 AUTO_FIREWALL=yes 时自动放行当前连接 IP
+  TZ=Asia/Shanghai         时区
+  ENABLE_SWAP=yes / ENABLE_FAIL2BAN=yes / DISABLE_IPV6=yes / ENABLE_JOURNALD=yes
+  ENABLE_UNATTENDED=yes / ENABLE_SYSSTAT=yes / CREATE_DATA_DIRS=yes
+  BACKUP_DIR=/var/backups/sysinit   LOG_DIR=/var/log   LOG_LEVEL=INFO
+
+示例:
+  AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
+USAGE
+    exit 0
+fi
+
 # ==============================================================================
 # 0. 全局常量与环境检测
 # ==============================================================================
-declare -- LOG_LEVEL="INFO"
+: "${LOG_LEVEL:=INFO}"
 declare -- __SUDO__=""
 declare -- __INSTALL_CMD__=""
 declare -- SERVER_TYPE=""
@@ -52,6 +84,7 @@ declare -- SOFTDIR="/data/software"
 : "${TZ:=Asia/Shanghai}"
 : "${SSH_PORT:=22}"
 : "${SSH_ALLOW_IPS:=}"
+: "${AUTO_WHITELIST_CURRENT_IP:=yes}"
 : "${BACKUP_DIR:=/var/backups/sysinit}"
 : "${LOG_DIR:=/var/log}"
 : "${ENABLE_SWAP:=no}"
@@ -112,21 +145,22 @@ __SAY__() {
         [Ee][Rr][Rr][Oo][Rr])   msg_level="ERROR";    LOGTYPE="ERRORCOLOR";  shift ;;
     esac
 
-    local current_priority=1 msg_priority=1
+    # LOG_LEVEL 表示“至少显示该级别及以上严重度”：DEBUG(0) < INFO/SUCCESS(1) < WARN(2) < ERROR(3)
+    local threshold=1 msg_severity=1
     case "${LOG_LEVEL}" in
-        [Ii][Nn][Ff][Oo]|[Ss][Uu][Cc][Cc][Ee][Ss][Ss]) current_priority=1 ;;
-        [Ww][Aa][Rr][Nn]) current_priority=2 ;;
-        [Ee][Rr][Rr][Oo][Rr]) current_priority=3 ;;
-        [Dd][Ee][Bb][Uu][Gg]) current_priority=4 ;;
+        [Dd][Ee][Bb][Uu][Gg]) threshold=0 ;;
+        [Ww][Aa][Rr][Nn])     threshold=2 ;;
+        [Ee][Rr][Rr][Oo][Rr]) threshold=3 ;;
+        *)                    threshold=1 ;;
     esac
     case "${msg_level}" in
-        INFO|SUCCESS) msg_priority=1 ;;
-        WARN) msg_priority=2 ;;
-        ERROR) msg_priority=3 ;;
-        DEBUG) msg_priority=4 ;;
+        DEBUG)        msg_severity=0 ;;
+        INFO|SUCCESS) msg_severity=1 ;;
+        WARN)         msg_severity=2 ;;
+        ERROR)        msg_severity=3 ;;
     esac
 
-    [ "${msg_priority}" -gt "${current_priority}" ] && return 0
+    [ "${msg_severity}" -lt "${threshold}" ] && return 0
 
     local log_line
     log_line="[$(date '+%Y-%m-%d_%H:%M:%S')] [${msg_level}] ${*}"
@@ -152,7 +186,7 @@ __BACKUP__() {
     local src="$1"
     local backup_root="${BACKUP_DIR}"
     ${__SUDO__} mkdir -p "${backup_root}" 2>/dev/null || true
-    local dest="${backup_root}/$(basename "${src}").$(date +%Y%m%d-%H%M%S)"
+    local dest="${backup_root}/$(basename "${src}").$(date +%Y%m%d-%H%M%S-%N)"
     if [ -f "${src}" ]; then
         if ${__SUDO__} cp -p "${src}" "${dest}" 2>/dev/null; then
             __SAY__ DEBUG "备份 ${src} -> ${dest}"
@@ -325,7 +359,8 @@ UTILS__DETECT_CLOUD__() {
             *Tencent*|*CVM*)     SERVER_TYPE="cloud"; __SAY__ INFO "云环境: 腾讯云" ;;
             *Microsoft*|*Azure*) SERVER_TYPE="cloud"; __SAY__ INFO "云环境: Azure" ;;
             *Oracle*)            SERVER_TYPE="cloud"; __SAY__ INFO "云环境: Oracle Cloud" ;;
-            *HVM*|*KVM*|*Virtual*) SERVER_TYPE="cloud" ;;  # 虚拟机，暂标记为 cloud
+            *HVM*)               SERVER_TYPE="cloud" ;;  # Xen HVM（AWS 等云）
+            *KVM*|*Virtual*|*VMware*|*VirtualBox*) SERVER_TYPE="vm"; __SAY__ INFO "虚拟机环境: 本地虚拟化" ;;
             *)                   SERVER_TYPE="local" ;;
         esac
     else
@@ -367,7 +402,7 @@ UTILS__DETECT_INIT_SYSTEM__() {
 # 0.10 工具存在性预检
 # ==============================================================================
 UTILS__PRECHECK_TOOLS__() {
-    local required_tools=("sed" "tee" "grep" "date" "printf" "uname" "id")
+    local required_tools=("sed" "tee" "grep" "awk" "date" "printf" "uname" "id")
     local missing=()
     for tool in "${required_tools[@]}"; do
         if ! UTILS__CMD_EXISTS__ "${tool}"; then
@@ -383,19 +418,27 @@ UTILS__PRECHECK_TOOLS__() {
 # ==============================================================================
 # 0.11 包安装函数（逐个安装，统计失败）
 # ==============================================================================
-# 修复 v2.1.0 的拆包失败坑：不再用引号包裹整串传给 apt-get
-# 逐包安装，失败的记入 __INSTALL_FAILED_PKGS__，不静默吞掉
+# 批量安装包（用数组展开为独立参数，避免 v2.1.0 的“引号包裹整串拆包失败”坑）
+# 先整批安装（快）；失败时逐个回退定位失败包并记入 __INSTALL_FAILED_PKGS__，不静默吞掉
 __INSTALL_PACKAGES__() {
     local pkgs=("$@")
-    local failed=()
-    for pkg in "${pkgs[@]}"; do
-        if DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} install -y "${pkg}" >/dev/null 2>&1; then
-            __SAY__ DEBUG "已安装: ${pkg}"
-        else
-            failed+=("${pkg}")
-            __SAY__ WARN "安装失败: ${pkg}"
-        fi
-    done
+    local failed=() cmd=()
+    case "${__INSTALL_CMD__}" in
+        apk)    cmd=(add) ;;
+        pacman) cmd=(-S --noconfirm) ;;
+        *)      cmd=(install -y) ;;
+    esac
+
+    if ! DEBIAN_FRONTEND=noninteractive ${__SUDO__} "${__INSTALL_CMD__}" "${cmd[@]}" "${pkgs[@]}" >/dev/null 2>&1; then
+        for pkg in "${pkgs[@]}"; do
+            if DEBIAN_FRONTEND=noninteractive ${__SUDO__} "${__INSTALL_CMD__}" "${cmd[@]}" "${pkg}" >/dev/null 2>&1; then
+                __SAY__ DEBUG "已安装: ${pkg}"
+            else
+                failed+=("${pkg}")
+                __SAY__ WARN "安装失败: ${pkg}"
+            fi
+        done
+    fi
     if [ ${#failed[@]} -gt 0 ]; then
         __INSTALL_FAILED_PKGS__="${__INSTALL_FAILED_PKGS__} ${failed[*]}"
         __SAY__ WARN "本轮失败包（稍后汇总）: ${failed[*]}"
@@ -432,7 +475,8 @@ __PRECHECK__() {
 __SET_HOSTNAME__() {
     local hostname="${HOSTNAME}"
     if [ -z "${hostname}" ]; then
-        hostname=$(tr -dc 'a-z0-9' < /dev/urandom | fold -w 8 | head -n 1)
+        # 首字符限定字母，避免生成以数字开头的不合法主机名
+        hostname="$(tr -dc 'a-z' < /dev/urandom | head -c 1)$(tr -dc 'a-z0-9' < /dev/urandom | fold -w 7 | head -n 1)"
     fi
 
     __SAY__ INFO "设置主机名: ${hostname}"
@@ -443,10 +487,12 @@ __SET_HOSTNAME__() {
         echo "${hostname}" | ${__SUDO__} tee /etc/hostname >/dev/null 2>&1
     fi
 
-    # 同步 /etc/hosts
+    # 同步 /etc/hosts（容器/只读 /etc 下 sed -i 可能 EBUSY，降级为告警而非中止）
     __BACKUP__ /etc/hosts
     if grep -q "127.0.1.1" /etc/hosts 2>/dev/null; then
-        ${__SUDO__} sed -i "/127.0.1.1/d" /etc/hosts
+        if ! ${__SUDO__} sed -i "/127.0.1.1/d" /etc/hosts 2>/dev/null; then
+            __SAY__ WARN "清理 /etc/hosts 旧 127.0.1.1 条目失败（/etc/hosts 可能只读或为挂载文件），跳过"
+        fi
     fi
     echo "127.0.1.1 ${hostname}" | ${__SUDO__} tee -a /etc/hosts >/dev/null
 }
@@ -470,7 +516,9 @@ __BASIC_INSTALL__() {
     # 包管理器缓存更新
     case "${__INSTALL_CMD__}" in
         apt-get)
-            DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} update -y
+            if ! DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} update -y; then
+                __SAY__ WARN "apt-get update 失败（可能网络/源异常），继续使用现有缓存"
+            fi
             # 系统安全更新（用户确认）
             if __CONFIRM__ "是否执行全系统安全更新（apt upgrade）？" "n"; then
                 DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} upgrade -y
@@ -509,7 +557,7 @@ __BASIC_INSTALL__() {
     # 安装常用工具（v2.2.0 修复：逐包安装，不再用引号包裹整串导致拆包失败）
     case "${__INSTALL_CMD__}" in
         apt-get)
-            local req_pkgs=(build-essential dos2unix vim htop bash-completion make git wget curl netcat-openbsd tmux tree ca-certificates chrony sudo lsof)
+            local req_pkgs=(build-essential dos2unix vim htop bash-completion make git wget curl netcat-openbsd tmux tree ca-certificates chrony sudo lsof iproute2)
             __INSTALL_PACKAGES__ "${req_pkgs[@]}"
 
             # 修复 root 用户 LANG 缺失报错问题
@@ -538,15 +586,11 @@ __BASIC_INSTALL__() {
             ;;
         apk)
             local alpine_tools=(build-base dos2unix vim htop bash-completion make git wget curl netcat-openbsd tmux tree ca-certificates chrony sudo lsof)
-            for pkg in "${alpine_tools[@]}"; do
-                ${__SUDO__} ${__INSTALL_CMD__} add "${pkg}" || true
-            done
+            __INSTALL_PACKAGES__ "${alpine_tools[@]}"
             ;;
         pacman)
             local arch_tools=(base-devel dos2unix vim htop bash-completion make git wget curl gnu-netcat tmux tree ca-certificates chrony sudo lsof)
-            for pkg in "${arch_tools[@]}"; do
-                ${__SUDO__} ${__INSTALL_CMD__} -S --noconfirm "${pkg}" || true
-            done
+            __INSTALL_PACKAGES__ "${arch_tools[@]}"
             ;;
     esac
 
@@ -603,7 +647,37 @@ __SET_SELINUX__() {
 # ==============================================================================
 # 3.1 防火墙配置 - ufw（唯一后端）
 # ==============================================================================
-__SET_FIREWALLD__() {
+# 探测当前 SSH 会话来源 IP（$SSH_CONNECTION 优先，其次 ss 推断）
+# 输出：单个 IPv4 地址；未连接 SSH（如本机执行）则输出空
+__GET_CURRENT_IP__() {
+    local ip=""
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        ip=$(printf '%s\n' "${SSH_CONNECTION}" | awk '{print $1}')
+    fi
+    # 校验为合法 IPv4，否则尝试从活动 SSH 会话推断
+    if ! printf '%s' "${ip}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        ip=""
+        if UTILS__CMD_EXISTS__ ss; then
+            # ss -tn state established 输出列: $3=本地 addr:port, $4=对端 addr:port
+            # 匹配本地端口为 SSH_PORT 的已建立连接，取对端 IPv4
+            ip=$(ss -tn state established 2>/dev/null | \
+                 awk -v p=":${SSH_PORT}$" 'NR>1 && $3 ~ p {
+                     split($4, a, ":"); c=a[1]
+                     if (c ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { print c; exit }
+                 }')
+        fi
+    fi
+    printf '%s\n' "${ip}"
+}
+
+# 关闭 ufw 的 IPv6 规则（/etc/default/ufw IPV6=no）
+__DISABLE_UFW_IPV6__() {
+    if [ -f /etc/default/ufw ]; then
+        ${__SUDO__} sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
+    fi
+}
+
+__SET_UFW__() {
     __SAY__ INFO "配置防火墙规则（ufw）..."
 
     # 交互确认
@@ -627,14 +701,11 @@ __SET_FIREWALLD__() {
     fi
 
     # 确保已安装 ufw
-    case "${__INSTALL_CMD__}" in
-        apt-get) DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} install -y ufw >/dev/null 2>&1 || true ;;
-        *)       ${__SUDO__} ${__INSTALL_CMD__} install -y ufw >/dev/null 2>&1 || true ;;
-    esac
+    DEBIAN_FRONTEND=noninteractive ${__SUDO__} ${__INSTALL_CMD__} install -y ufw >/dev/null 2>&1 || true
 
     # 关闭 IPv6 规则（若 DISABLE_IPV6）
     if __ENV_YES__ "${DISABLE_IPV6}"; then
-        ${__SUDO__} sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
+        __DISABLE_UFW_IPV6__
     fi
 
     # 首次启用时重置（幂等：已初始化过则保留现有规则）
@@ -646,6 +717,27 @@ __SET_FIREWALLD__() {
     ${__SUDO__} ufw default deny incoming
     ${__SUDO__} ufw default allow outgoing
 
+    # 交互询问：是否自动将当前连接 IP 加入白名单
+    local auto_whitelist="no"
+    if [ -t 0 ] && [ "${AUTO_FIREWALL}" != "yes" ]; then
+        if __CONFIRM__ "是否自动将当前连接的 IP 加入白名单（防止误锁）？" "y"; then
+            auto_whitelist="yes"
+        fi
+    elif [ "${AUTO_FIREWALL}" = "yes" ] && __ENV_YES__ "${AUTO_WHITELIST_CURRENT_IP}"; then
+        auto_whitelist="yes"
+    fi
+
+    local current_ip=""
+    if [ "${auto_whitelist}" = "yes" ]; then
+        current_ip=$(__GET_CURRENT_IP__)
+        if [ -n "${current_ip}" ]; then
+            __SAY__ INFO "自动放行当前连接 IP: ${current_ip}（SSH 端口 ${SSH_PORT}）"
+            ${__SUDO__} ufw allow from "${current_ip}" to any port "${SSH_PORT}" proto tcp
+        else
+            __SAY__ WARN "未检测到当前连接 IP（可能本机直连），跳过自动白名单"
+        fi
+    fi
+
     # SSH 放行（限源或全放）
     if [ -n "${SSH_ALLOW_IPS}" ]; then
         local IFS_BAK="${IFS}"
@@ -655,6 +747,9 @@ __SET_FIREWALLD__() {
             [ -n "${ip}" ] && ${__SUDO__} ufw allow from "${ip}" to any port "${SSH_PORT}" proto tcp
         done
         IFS="${IFS_BAK}"
+    elif [ "${auto_whitelist}" = "yes" ] && [ -n "${current_ip}" ]; then
+        # 已放行当前 IP，不再全放开 SSH
+        __SAY__ INFO "已通过白名单放行当前 IP (${current_ip})，SSH 不再对全来源开放"
     else
         __SAY__ WARN "SSH_ALLOW_IPS 未设置，SSH 放行所有来源（云安全组应限源兜底）"
         ${__SUDO__} ufw allow "${SSH_PORT}"/tcp
@@ -696,7 +791,10 @@ __SET_FIREWALLD__() {
     ${__SUDO__} systemctl disable --now firewalld 2>/dev/null || true
 
     # 启用 ufw
-    ${__SUDO__} ufw --force enable
+    if ! ${__SUDO__} ufw --force enable; then
+        __SAY__ ERROR "ufw 启用失败（可能需要 NET_ADMIN 权限或 iptables/nftables 支持），请手工排查"
+        exit 1
+    fi
     ${__SUDO__} systemctl enable ufw 2>/dev/null || true
 
     __SAY__ SUCCESS "ufw 防火墙已启用（默认 deny incoming，SSH ${SSH_PORT} 已放行）"
@@ -736,8 +834,7 @@ fs.inotify.max_user_watches = 524288
 vm.max_map_count = 655360
 
 # --- [3] Netfilter 连接跟踪提升（需 nf_conntrack 模块）---
-net.nf_conntrack_max = 25000000
-net.netfilter.nf_conntrack_max = 25000000
+# nf_conntrack_max 在下方按内存动态计算后追加（避免小内存机器被 25M 条目拖垮）
 net.netfilter.nf_conntrack_tcp_timeout_established = 180
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 120
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
@@ -781,6 +878,17 @@ EOF
 
     # v2.2.0 修复：先加载 nf_conntrack 模块再 sysctl，避免 nf_conntrack_* 参数失败
     ${__SUDO__} modprobe nf_conntrack 2>/dev/null || true
+
+    # nf_conntrack_max 按内存动态计算（约 16KB 内存/条，夹在 65536~1048576 之间）
+    local mem_kb conntrack_max
+    mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    conntrack_max=$(( mem_kb / 16 ))
+    [ "${conntrack_max}" -lt 65536 ] && conntrack_max=65536
+    [ "${conntrack_max}" -gt 1048576 ] && conntrack_max=1048576
+    {
+        echo "net.nf_conntrack_max = ${conntrack_max}"
+        echo "net.netfilter.nf_conntrack_max = ${conntrack_max}"
+    } | ${__SUDO__} tee -a /etc/sysctl.d/99-zz-sysctl.conf >/dev/null
 
     __SAY__ INFO "加载内核参数..."
     # v2.2.0 修复：用 -e 忽略未知 key（如某些环境无 nf_conntrack），但仍报告其他错误
@@ -832,10 +940,9 @@ __SET_DEVSEC_OS_HARDEN__() {
         fi
     fi
 
-    # 2. 口令安全策略强化
+    # 2. 口令安全策略强化（复用上方已备份的 /etc/login.defs）
     if [ -f "/etc/login.defs" ]; then
         __SAY__ INFO "强化登录密码超时失效及过期策略 (/etc/login.defs)..."
-        __BACKUP__ /etc/login.defs
         ${__SUDO__} sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS 90/' /etc/login.defs
         ${__SUDO__} sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS 7/' /etc/login.defs
         ${__SUDO__} sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE 14/' /etc/login.defs
@@ -880,16 +987,27 @@ __SET_TIMEZONE__() {
         fi
     fi
 
-    # v2.2.0 新增：云环境优化 NTP 源（阿里云内网 ntp.aliyun.com）
+    # 云环境优化 NTP 源（按云厂商映射内网 NTP，非已知厂商保持默认 pool）
     if [ "${SERVER_TYPE}" = "cloud" ] && [ -f /etc/chrony/chrony.conf ]; then
-        __SAY__ INFO "检测到云环境，优化 chrony NTP 源..."
-        __BACKUP__ /etc/chrony/chrony.conf
-        # 在首行追加阿里云 NTP（不影响原有 pool）
-        if ! grep -q "ntp.aliyun.com" /etc/chrony/chrony.conf 2>/dev/null; then
-            ${__SUDO__} sed -i '1i server ntp.aliyun.com iburst' /etc/chrony/chrony.conf
+        local ntp_server="" product=""
+        product=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || echo "")
+        case "${product}" in
+            *Alibaba*|*Aliyun*) ntp_server="ntp.aliyun.com" ;;
+            *Amazon*|*EC2*)     ntp_server="169.254.169.123" ;;
+            *Google*|*GCE*)     ntp_server="metadata.google.internal" ;;
+            *Tencent*|*CVM*)    ntp_server="ntp.tencent.com" ;;
+        esac
+        if [ -n "${ntp_server}" ]; then
+            __SAY__ INFO "检测到云环境，优化 chrony NTP 源 (${ntp_server})..."
+            __BACKUP__ /etc/chrony/chrony.conf
+            if ! grep -q "${ntp_server}" /etc/chrony/chrony.conf 2>/dev/null; then
+                ${__SUDO__} sed -i "1i server ${ntp_server} iburst" /etc/chrony/chrony.conf
+            fi
+            ${__SUDO__} systemctl restart chronyd.service 2>/dev/null || \
+            ${__SUDO__} systemctl restart chrony.service 2>/dev/null || true
+        else
+            __SAY__ INFO "云环境未识别具体厂商，保持默认 chrony NTP 源"
         fi
-        ${__SUDO__} systemctl restart chronyd.service 2>/dev/null || \
-        ${__SUDO__} systemctl restart chrony.service 2>/dev/null || true
     fi
 }
 
@@ -970,6 +1088,7 @@ CRONEOF
     sharedscripts
     postrotate
         /usr/bin/find /var/log/cmdAudit/ -name "*.log" -mtime +90 -delete
+        if command -v chattr >/dev/null 2>&1; then chattr +a /var/log/cmdAudit/*.log 2>/dev/null || true; fi
     endscript
 }
 LOGROTEOF
@@ -1043,7 +1162,6 @@ __SET_SSHD_CONFIG__() {
         ["LoginGraceTime"]="60"
         ["ClientAliveInterval"]="300"
         ["ClientAliveCountMax"]="3"
-        ["Protocol"]="2"
     )
 
     # v2.2.0 新增：DISABLE_IPV6 时设 AddressFamily inet
@@ -1129,9 +1247,7 @@ EOF
     ${__SUDO__} sysctl -e -p /etc/sysctl.d/99-disable-ipv6.conf >/dev/null 2>&1 || true
 
     # ufw 关闭 IPv6 规则
-    if [ -f /etc/default/ufw ]; then
-        ${__SUDO__} sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
-    fi
+    __DISABLE_UFW_IPV6__
 
     # nginx 去 [::] 监听（若已装）
     if [ -f /etc/nginx/sites-enabled/default ]; then
@@ -1203,13 +1319,16 @@ enabled = true
 port = ${SSH_PORT}
 filter = sshd
 logpath = %(sshd_log)s
-backend = systemd
+backend = __FAIL2BAN_BACKEND__
 maxretry = 5
 findtime = 600
 bantime = 3600
 EOF
-    # 替换 SSH_PORT 占位（jail.local 不支持变量，需实际值）
+    # 替换占位符（jail.local 不支持变量，需实际值）
     ${__SUDO__} sed -i "s/\${SSH_PORT}/${SSH_PORT}/" /etc/fail2ban/jail.local 2>/dev/null || true
+    local fb_backend="auto"
+    [ "${__INIT_SYSTEM__}" = "systemd" ] && fb_backend="systemd"
+    ${__SUDO__} sed -i "s/__FAIL2BAN_BACKEND__/${fb_backend}/" /etc/fail2ban/jail.local 2>/dev/null || true
 
     ${__SUDO__} systemctl enable --now fail2ban 2>/dev/null || true
 
@@ -1284,7 +1403,7 @@ __MAIN__() {
     __SET_SOURCEREPO__
     __BASIC_INSTALL__
     __SET_SELINUX__
-    __SET_FIREWALLD__
+    __SET_UFW__
     __SET_KERN_OPTIMIZE__
     __SET_DEVSEC_OS_HARDEN__
     __SET_TIMEZONE__
@@ -1310,6 +1429,9 @@ EOF
         __SAY__ WARN "以下包安装失败，需手工补装: ${__INSTALL_FAILED_PKGS__}"
     fi
     __SAY__ INFO "新内核参数配置与登录策略调整建议在适当时机重启服务器 (reboot) 后以取得最深度的优化支持。"
+    if __ENV_YES__ "${AUTO_SSH}"; then
+        __SAY__ WARN "SSH 已加固为仅密钥登录（PasswordAuthentication no / PermitRootLogin prohibit-password）：请先确认已配置公钥再断开当前会话"
+    fi
 
     __CLEANUP_TMP__
 }

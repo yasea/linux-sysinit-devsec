@@ -66,7 +66,8 @@ AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 | `HOSTNAME` | (随机生成) | 自定义主机名 |
 | `TZ` | `Asia/Shanghai` | 系统时区 |
 | `SSH_PORT` | `22` | SSH 服务端口（防火墙放行此端口） |
-| `SSH_ALLOW_IPS` | (空) | SSH 放行源 IP，逗号分隔（如 `1.2.3.4,5.6.7.8`）。留空=放行所有并告警 |
+| `SSH_ALLOW_IPS` | (空) | SSH 放行源 IP，逗号分隔（如 `1.2.3.4,5.6.7.8`）。留空时：若自动白名单生效则只放行当前 IP，否则放行所有来源并告警 |
+| `AUTO_WHITELIST_CURRENT_IP` | `yes` | 非交互且 `AUTO_FIREWALL=yes` 时，自动将当前连接 IP 加入 SSH 白名单（防止误锁） |
 | `ENABLE_SWAP` | `no` | 设为 `yes` 创建 4G swapfile |
 | `SWAP_SIZE` | `4G` | swap 大小（如 `4G`/`8G`） |
 | `ENABLE_FAIL2BAN` | `no` | 设为 `yes` 安装并配置 fail2ban sshd jail |
@@ -103,13 +104,14 @@ AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 脚本会引导你完成以下配置：
 
 1. **确认是否启用防火墙** — 默认推荐启用
-2. **自动应用基础规则**：
+2. **是否自动将当前连接的 IP 加入白名单** — 默认推荐启用（防止误锁；非交互时由 `AUTO_WHITELIST_CURRENT_IP=yes` 控制）
+3. **自动应用基础规则**：
    - 默认策略: DROP/deny（拒绝所有入站）
    - 回环接口 (`lo`) 全部放行
    - 已建立连接 (`ESTABLISHED,RELATED`) 放行
    - SSH 端口放行（默认 22，可通过 `SSH_PORT` 修改；`SSH_ALLOW_IPS` 限源）
    - ICMP ping 有限速率放行
-3. **自定义 IP:端口规则** — 循环添加，支持：
+4. **自定义 IP:端口规则** — 循环添加，支持：
    - 指定源 IP（留空表示所有来源）
    - 目标端口号
    - 协议（tcp/udp）
@@ -156,6 +158,7 @@ AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| 2.2.2 | 2026-08-15 | 修复：`__GET_CURRENT_IP__` ss 兜底死代码（自动白名单失效）、`__SAY__` 日志级别颠倒导致 WARN/ERROR 被吞、`LOG_LEVEL` 环境变量失效、移除废弃的 sshd `Protocol`、`nf_conntrack_max` 按内存动态计算；增强：批量安装包+失败回退、按云厂商映射 NTP、区分本地虚拟机/云环境、fail2ban backend 按 init 系统、`--help` 与 bash 版本检查、`/etc/hosts` sed 容错 |
 | 2.2.0 | 2026-08-14 | P0 修复：apt 拆包失败、iptables LOG 语法、umask 027→022+USERGROUPS_ENAB、防火墙改 ufw；P1 增强：SSH 补 LoginGraceTime/AddressFamily/cloud-init 修正、审计权限 666、新增 swap/fail2ban/IPv6/journald/unattended/sysstat/data目录/deploy账号可选模块；P2：SSH 限源、nf_conntrack modprobe、云环境 NTP 优化、错误汇总 |
 | 2.2.1 | 2026-08-14 | 防火墙统一为 ufw（移除 iptables 后端）；修复 swap dd 回退单位错误、ufw reset 幂等性；移除 deploy 部署账号模块 |
 | 2.1.0 | 2026-08-04 | 交互式防火墙/SSH、兼容性增强、P0 缺陷修复、日志与备份完善 |
