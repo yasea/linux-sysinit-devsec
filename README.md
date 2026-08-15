@@ -22,12 +22,19 @@ Linux 服务器快速初始化、性能调优与 Dev-Sec 安全基线加固脚�
 | 命令审计 | PROMPT_COMMAND 审计 + logrotate 轮转（666+chattr +a） | — | — |
 | 禁用服务 | 关闭 postfix/rpcbind/exim4 等非必要服务 | — | — |
 | **SSH 加固** | 禁用 root 密码登录、密钥认证、防锁死回滚、修正 cloud-init 覆盖 | ✅ **交互式配置** | — |
-| **swap** | 4G swapfile + fstab 持久化 | — | `ENABLE_SWAP` |
+| **swap** | swapfile + fstab 持久化（默认 4G，可通过 `SWAP_SIZE` 调整） | — | `ENABLE_SWAP` |
 | **fail2ban** | sshd jail 安装与配置 | — | `ENABLE_FAIL2BAN` |
 | **关闭 IPv6** | sysctl + ufw + sshd + nginx 全链路关闭 | — | `DISABLE_IPV6` |
 | **journald** | 持久化 256M/30天 | — | `ENABLE_JOURNALD` |
 | **unattended** | 自动安全更新 | — | `ENABLE_UNATTENDED` |
 | **sysstat** | sar 系统活动采集 | — | `ENABLE_SYSSTAT` |
+| **auditd** | 系统级审计（认证/sudo/cron/模块/权限） | — | `ENABLE_AUDITD` |
+| **modprobe 黑名单** | 禁用高风险内核模块（cramfs/dccp/sctp/hfs 等） | — | `ENABLE_MODPROBE_HARDEN` |
+| **安全工具** | rkhunter/clamav/lynis + 自动化扫描 cron | — | `ENABLE_SECURITY_TOOLS` |
+| **nginx 安全头** | 检测到 nginx 时应用安全响应头 | — | `ENABLE_NGINX_HARDEN` |
+| **服务发现** | 扫描监听端口 + 推断 enabled 服务端口 + 用户确认"不可触碰" | ✅ **交互式确认** | `EXTRA_ALLOW_PORTS` |
+| **分级加固** | `minimal`/`standard`/`enhanced` 一键启用对应安全模块 | — | `HARDENING_LEVEL` |
+| **合规报告** | CIS 基线检查项（ASLR/SSH/ufw/auditd 等 12 项） | — | — |
 | **/data 目录** | 创建 apps/scripts/backups/nginx-sites/creds 标准结构 | — | `CREATE_DATA_DIRS` |
 
 ## 支持的操作系统
@@ -75,6 +82,12 @@ AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 | `ENABLE_JOURNALD` | `no` | 设为 `yes` 配置 journald 持久化（256M/30天） |
 | `ENABLE_UNATTENDED` | `no` | 设为 `yes` 启用 unattended-upgrades 自动安全更新 |
 | `ENABLE_SYSSTAT` | `no` | 设为 `yes` 安装 sysstat/sar |
+| `ENABLE_AUDITD` | `no` | 设为 `yes` 启用 auditd 系统级审计（认证/sudo/cron/模块/权限） |
+| `ENABLE_MODPROBE_HARDEN` | `no` | 设为 `yes` 禁用高风险内核模块（cramfs/dccp/sctp/hfs 等） |
+| `ENABLE_SECURITY_TOOLS` | `no` | 设为 `yes` 安装 rkhunter/clamav/lynis + 自动化扫描 cron |
+| `ENABLE_NGINX_HARDEN` | `no` | 设为 `yes` 检测到 nginx 时应用安全响应头 |
+| `HARDENING_LEVEL` | (空) | 分级加固：`minimal`/`standard`/`enhanced`，一键启用对应安全模块 |
+| `EXTRA_ALLOW_PORTS` | (空) | 额外放行端口（逗号分隔），覆盖服务发现时序盲区（服务在扫描后才启动时） |
 | `CREATE_DATA_DIRS` | `no` | 设为 `yes` 创建 `/data` 业务目录结构 |
 | `BACKUP_DIR` | `/var/backups/sysinit` | 配置文件修改备份目录 |
 | `LOG_DIR` | `/var/log` | 执行日志保存目录 |
@@ -95,6 +108,13 @@ SSH_PORT=2222 SSH_ALLOW_IPS=10.0.0.0/8 bash sysinit.sh
 
 # 最小化（仅基础加固，不加可选模块）
 AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
+
+# 分级加固：standard 启用 auditd/modprobe/fail2ban/journald，enhanced 再加安全工具/nginx/unattended
+HARDENING_LEVEL=standard AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
+HARDENING_LEVEL=enhanced AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
+
+# 额外放行端口（覆盖服务在扫描后才启动的时序盲区）
+EXTRA_ALLOW_PORTS=428,8443 AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 ```
 
 ## 交互式配置说明
@@ -158,6 +178,8 @@ AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| 2.3.1 | 2026-08-15 | **代码审计修复**：合规报告 `sshd -T` 改单次执行+`|| true` 兜底（避免 `set -e` 退出）、服务发现端口提取管道补 `|| true`（`pipefail` 下 grep 无匹配不退出）、modprobe `lsmod` 模块名兼容 `-`/`_` 两种写法、提取 `__CHECK__` 单行辅助消除重复代码、清理 `tr ' ' '`/`changed` 死代码、dry-run 计划与执行顺序同步；README 功能表补列 2.3.0 新增模块、示例区补充 `HARDENING_LEVEL`/`EXTRA_ALLOW_PORTS` 用法 |
+| 2.3.0 | 2026-08-15 | **安全纵深增强**：新增服务发现与"不可触碰"确认（对齐 hardening-skill 阶段0）、SSH 公钥存在性预检防逻辑锁死、auditd 系统审计、内核模块禁用（modprobe 黑名单）、安全工具+自动化扫描 cron（rkhunter/clamav/lynis）、nginx 安全头、分级加固等级 `HARDENING_LEVEL`、合规报告、`--dry-run` 预演、flock 并发锁、备份清理策略、SSH drop-in 全参数覆盖、`tcp_tw_reuse` NAT 风险注释；**服务发现增强**：推断 enabled 服务端口 + `EXTRA_ALLOW_PORTS` 显式声明，覆盖"服务在扫描后才启动"的时序盲区 |
 | 2.2.2 | 2026-08-15 | 修复：`__GET_CURRENT_IP__` ss 兜底死代码（自动白名单失效）、`__SAY__` 日志级别颠倒导致 WARN/ERROR 被吞、`LOG_LEVEL` 环境变量失效、移除废弃的 sshd `Protocol`、`nf_conntrack_max` 按内存动态计算；增强：批量安装包+失败回退、按云厂商映射 NTP、区分本地虚拟机/云环境、fail2ban backend 按 init 系统、`--help` 与 bash 版本检查、`/etc/hosts` sed 容错 |
 | 2.2.0 | 2026-08-14 | P0 修复：apt 拆包失败、iptables LOG 语法、umask 027→022+USERGROUPS_ENAB、防火墙改 ufw；P1 增强：SSH 补 LoginGraceTime/AddressFamily/cloud-init 修正、审计权限 666、新增 swap/fail2ban/IPv6/journald/unattended/sysstat/data目录/deploy账号可选模块；P2：SSH 限源、nf_conntrack modprobe、云环境 NTP 优化、错误汇总 |
 | 2.2.1 | 2026-08-14 | 防火墙统一为 ufw（移除 iptables 后端）；修复 swap dd 回退单位错误、ufw reset 幂等性；移除 deploy 部署账号模块 |
