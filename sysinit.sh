@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 ################################################################################
 #   Author      : 0x5c0f (Enhanced with Dev-Sec Baseline & Anti-Lockout)
-#   Date        : 2026-08-14
-#   Version     : 2.3.0
+#   Date        : 2026-08-16
+#   Version     : 2.4.0
 #   Description : Linux Server Fast Init, Performance & Dev-Sec Security Hardening
 #   Usage       : bash ./sysinit.sh
 #   Environment :
@@ -13,7 +13,7 @@
 #       SSH_PORT=22         SSH端口（默认22）
 #       SSH_ALLOW_IPS=      SSH放行源IP（逗号分隔，留空=放行所有并告警）
 #       AUTO_WHITELIST_CURRENT_IP=yes  非交互且 AUTO_FIREWALL=yes 时自动将当前连接IP加入SSH白名单（默认yes）
-#       ENABLE_SWAP=yes     创建 4G swapfile（默认 no）
+#       ENABLE_SWAP=yes     创建 swapfile（默认 no）
 #       SWAP_SIZE=4G        swap 大小（默认 4G）
 #       ENABLE_FAIL2BAN=yes 安装并配置 fail2ban sshd jail（默认 no）
 #       DISABLE_IPV6=yes    关闭 IPv6（默认 no）
@@ -21,6 +21,9 @@
 #       ENABLE_UNATTENDED=yes 启用 unattended-upgrades 安全自动更新（默认 no）
 #       ENABLE_SYSSTAT=yes  安装 sysstat/sar 系统活动采集（默认 no）
 #       CREATE_DATA_DIRS=yes 创建 /data 业务目录结构（默认 no）
+#       ENABLE_CVE_SCAN=yes     升级前预扫描待修复安全更新清单（默认 no，enhanced 自动启用）
+#       ENABLE_ACCOUNT_AUDIT=yes 账户/权限审计+基线快照（默认 no，enhanced 自动启用）
+#       REPORT_FORMAT=text|json  合规报告输出格式（默认 text）
 ################################################################################
 
 set -euo pipefail
@@ -41,6 +44,15 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 
 一键完成 Linux 服务器初始化与 Dev-Sec 安全基线加固。
 
+交互模式（直接 bash sysinit.sh，TTY 环境）会引导你完成：
+  1. 加固等级选择（minimal/standard/enhanced，含耗时预期）
+  2. 钻取微调（可选，逐项开关 8 个安全模块）
+  3. 业务模块配置（SWAP/IPv6/数据目录/sysstat）
+  4. 配置确认（取消则干净退出）
+  结尾会打印等价的环境变量命令，可复制到 CI/批量部署复现本次选择。
+
+非交互模式请用环境变量（见下）+ AUTO_FIREWALL=yes AUTO_SSH=yes。
+
 选项:
   --help      显示本帮助
   --dry-run   预演模式：仅检测环境并打印将执行的计划，不实际修改系统
@@ -57,11 +69,13 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   ENABLE_SWAP=yes / ENABLE_FAIL2BAN=yes / DISABLE_IPV6=yes / ENABLE_JOURNALD=yes
   ENABLE_UNATTENDED=yes / ENABLE_SYSSTAT=yes / CREATE_DATA_DIRS=yes
   ENABLE_AUDITD=yes / ENABLE_MODPROBE_HARDEN=yes / ENABLE_SECURITY_TOOLS=yes / ENABLE_NGINX_HARDEN=yes
-  BACKUP_DIR=/var/backups/sysinit   LOG_DIR=/var/log   LOG_LEVEL=INFO
+  ENABLE_CVE_SCAN=yes / ENABLE_ACCOUNT_AUDIT=yes   REPORT_FORMAT=text|json
+  BACKUP_DIR=/var/lib/sysinit/backups   LOG_DIR=/var/log/sysinit   STATE_DIR=/var/lib/sysinit   LOG_LEVEL=INFO
 
 示例:
   AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
   HARDENING_LEVEL=enhanced AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
+  REPORT_FORMAT=json bash sysinit.sh   # 合规报告输出 JSON
   bash sysinit.sh --dry-run
 USAGE
     exit 0
@@ -101,8 +115,11 @@ declare -- SOFTDIR="/data/software"
 : "${SSH_PORT:=22}"
 : "${SSH_ALLOW_IPS:=}"
 : "${AUTO_WHITELIST_CURRENT_IP:=yes}"
-: "${BACKUP_DIR:=/var/backups/sysinit}"
-: "${LOG_DIR:=/var/log}"
+: "${BACKUP_DIR:=/var/lib/sysinit/backups}"        # 配置文件修改备份目录
+: "${BACKUP_KEEP:=10}"                            # 每个源文件保留的备份份数（超出按时间倒序删除）
+: "${CVE_KEEP:=10}"                               # CVE 预扫描清单保留份数（超出按时间倒序删除）
+: "${LOG_DIR:=/var/log/sysinit}"                   # 执行日志目录（保留在 /var/log 下兼容系统日志工具）
+: "${STATE_DIR:=/var/lib/sysinit}"                 # 运行时状态根目录（执行标记/审计基线/CVE清单等）
 : "${ENABLE_SWAP:=no}"
 : "${SWAP_SIZE:=4G}"
 : "${ENABLE_FAIL2BAN:=no}"
@@ -117,6 +134,10 @@ declare -- SOFTDIR="/data/software"
 : "${CREATE_DATA_DIRS:=no}"
 : "${HARDENING_LEVEL:=}"   # minimal|standard|enhanced：一键启用对应等级的可选安全模块
 : "${EXTRA_ALLOW_PORTS:=}" # 额外放行端口（逗号分隔），覆盖服务发现时序盲区（服务在扫描后才启动）
+: "${ENABLE_CVE_SCAN:=no}"      # 升级前预扫描待修复安全更新清单（不自动升级）
+: "${ENABLE_ACCOUNT_AUDIT:=no}" # 账户/权限审计（UID0/SUID/SGID/world-writable/sudoers）+ 基线快照
+: "${AUDIT_SNAPSHOT_DIR:=/var/lib/sysinit/audit}" # 账户审计基线快照目录
+: "${REPORT_FORMAT:=text}"      # 合规报告输出格式：text|json
 
 # 标记 yes/no 环境变量
 __ENV_YES__() { [[ "${1}" =~ ^[Yy][Ee][Ss]$ ]]; }
@@ -126,7 +147,7 @@ __ENV_YES__() { [[ "${1}" =~ ^[Yy][Ee][Ss]$ ]]; }
 # 通过 HARDENING_LEVEL 一键启用对应等级的可选安全模块，避免"全量或全无"
 #   minimal  : 仅基础加固（不额外启用可选模块）
 #   standard : 启用 auditd + modprobe 内核模块禁用 + fail2ban + journald
-#   enhanced : 在 standard 基础上 + 安全工具扫描 + nginx 安全头 + unattended
+#   enhanced : 在 standard 基础上 + 安全工具扫描 + nginx 安全头 + unattended + CVE 预扫描 + 账户审计
 # 显式设置的 ENABLE_* 优先于等级默认值（不覆盖用户已明确指定的开关）
 # ==============================================================================
 __APPLY_HARDENING_LEVEL__() {
@@ -143,6 +164,8 @@ __APPLY_HARDENING_LEVEL__() {
             [ "${ENABLE_SECURITY_TOOLS}" = "no" ]  && ENABLE_SECURITY_TOOLS=yes
             [ "${ENABLE_NGINX_HARDEN}" = "no" ]    && ENABLE_NGINX_HARDEN=yes
             [ "${ENABLE_UNATTENDED}" = "no" ]      && ENABLE_UNATTENDED=yes
+            [ "${ENABLE_CVE_SCAN}" = "no" ]        && ENABLE_CVE_SCAN=yes
+            [ "${ENABLE_ACCOUNT_AUDIT}" = "no" ]   && ENABLE_ACCOUNT_AUDIT=yes
             ;;
     esac
     if [ -n "${HARDENING_LEVEL}" ]; then
@@ -216,11 +239,12 @@ __SAY__() {
     local log_line
     log_line="[$(date '+%Y-%m-%d_%H:%M:%S')] [${msg_level}] ${*}"
 
-    # 控制台彩色输出
+    # 控制台彩色输出走 stderr（日志属诊断流；stdout 留给程序数据输出，如合规报告 JSON）
+    # 这样 REPORT_FORMAT=json 时 stdout 仅含 JSON，可直接管道 jq，无需 2>/dev/null 过滤
     printf "[%s] [%b%s%b] %s%b\n" \
         "$(date '+%Y-%m-%d_%H:%M:%S')" \
         "${!LOGTYPE}" "${msg_level}" "${ENDCOLOR}" \
-        "${*}" "${ENDCOLOR}"
+        "${*}" "${ENDCOLOR}" >&2
 
     # 文件日志（无颜色，需 root 写入 /var/log）
     if [ -n "${__LOG_FILE__}" ] && [ -w "$(dirname "${__LOG_FILE__}")" ]; then
@@ -238,7 +262,7 @@ __BANNER__() {
     printf "${C}"
     printf "==============================================================\n"
     printf "   Linux Server Fast Init & Dev-Sec Security Hardening\n"
-    printf "   sysinit.sh  v2.3.0\n"
+    printf "   sysinit.sh  v2.4.0\n"
     printf "==============================================================\n"
     printf "${R}\n"
 }
@@ -267,10 +291,13 @@ __BACKUP__() {
             __SAY__ WARN "备份失败: ${src}"
         fi
     fi
-    # 备份清理策略：每个源文件仅保留最近 10 份，更早的删除（防止长期积累）
+    # 备份清理策略：每个源文件仅保留最近 ${BACKUP_KEEP} 份，更早的删除（防止长期积累）
+    # 用 find 而非 ls（ls 输出含路径前缀，xargs 易出错；find -printf 输出纯路径可安全管道）
     local base
     base="$(basename "${src}")"
-    ${__SUDO__} bash -c "ls -1t '${backup_root}'/${base}.* 2>/dev/null | tail -n +11 | xargs -r rm -f" 2>/dev/null || true
+    ${__SUDO__} find "${backup_root}" -maxdepth 1 -name "${base}.*" -type f -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | awk -v keep="${BACKUP_KEEP}" 'NR>keep{print $2}' \
+        | xargs -r ${__SUDO__} rm -f 2>/dev/null || true
 }
 
 # ==============================================================================
@@ -331,12 +358,18 @@ __PROMPT__() {
         return 0
     fi
 
+    # 用 read -rp 直接输出提示符（走 stderr，不写入 stdout），
+    # 避免此前 printf→stdout 与 read→stdin 在 ssh pty 下共用 fd 时
+    # 提示符文本被回读为输入的 bug。
     if [ -n "${default}" ]; then
-        printf "  ${C}?${R} %s ${C}[%s]${R}: " "${prompt}" "${default}"
+        read -rp "$(printf "  ${C}?${R} %s ${C}[%s]${R}: " "${prompt}" "${default}")" input
     else
-        printf "  ${C}?${R} %s: " "${prompt}"
+        read -rp "$(printf "  ${C}?${R} %s: " "${prompt}")" input
     fi
-    read -r input
+    # 去除首尾空白与可能的回车符，避免回显污染导致校验失败
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+    input="${input%$'\r'}"
     echo "${input:-${default}}"
 }
 
@@ -542,10 +575,10 @@ test ! -d "${SOFTDIR}" && ${__SUDO__} mkdir -p "${SOFTDIR}" || true
 # 1. 基础系统属性设置
 # ==============================================================================
 __PRECHECK__() {
-    if [ -f "/opt/.server.init.executed" ]; then
-        __SAY__ WARN "系统初始化标记已存在 (/opt/.server.init.executed)"
+    if [ -f "${STATE_DIR}/.executed" ]; then
+        __SAY__ WARN "系统初始化标记已存在 (${STATE_DIR}/.executed)"
         if ! __CONFIRM__ "是否忽略标记继续执行？" "n"; then
-            __SAY__ ERROR "如需重新执行，请删除 /opt/.server.init.executed 标记文件后重试。"
+            __SAY__ ERROR "如需重新执行，请删除 ${STATE_DIR}/.executed 标记文件后重试。"
             exit 1
         fi
     fi
@@ -1399,24 +1432,294 @@ NGINXEOF
 }
 
 # ==============================================================================
-# 7.6 合规报告（CIS 检查项清单 + 通过/未通过）
+# 6.5 可选：CVE 漏洞预扫描（升级前出待修复安全更新清单，不自动升级）
 # ==============================================================================
+__SET_CVE_SCAN__() {
+    if ! __ENV_YES__ "${ENABLE_CVE_SCAN}"; then
+        __SAY__ INFO "CVE 预扫描未启用（ENABLE_CVE_SCAN=no；HARDENING_LEVEL=enhanced 自动启用），跳过"
+        return 0
+    fi
+    __SAY__ INFO "扫描待修复安全更新（CVE 预扫描）..."
+
+    ${__SUDO__} mkdir -p "${STATE_DIR}/cve" 2>/dev/null || true
+    local scan_log="${STATE_DIR}/cve/cve-prescan-$(date +%Y%m%d-%H%M%S).list"
+    local result=""
+    local label=""
+
+    case "${__INSTALL_CMD__}" in
+        apt-get)
+            # apt 无原生 CVE 分类，apt-get -s upgrade 捕获全部可升级包（含安全与非安全）
+            result=$(apt-get -s upgrade 2>/dev/null | grep '^Inst' || true)
+            if [ -n "${result}" ]; then
+                label="待升级包（apt 模拟，含安全与非安全更新；apt 无原生 CVE 分类）"
+            else
+                result=$(apt list --upgradable 2>/dev/null | grep -v '^Listing' || true)
+                label="可升级包清单"
+            fi
+            ;;
+        yum|dnf)
+            # 优先 dnf/yum updateinfo --security，插件缺失则降级为 check-update
+            result=$(dnf updateinfo list --security 2>/dev/null || yum updateinfo list security 2>/dev/null || true)
+            if [ -z "${result}" ]; then
+                __SAY__ WARN "updateinfo 安全插件不可用，降级为可升级包清单"
+                result=$(${__INSTALL_CMD__} check-update 2>/dev/null | grep -E '\.(x86_64|noarch|i686|aarch64)' || true)
+                label="可升级包清单（无 CVE 分类）"
+            else
+                label="安全更新清单（updateinfo）"
+            fi
+            ;;
+        zypper)
+            result=$(zypper list-patches --category security 2>/dev/null || true)
+            label="安全补丁清单（zypper）"
+            ;;
+        apk)
+            result=$(apk list -u 2>/dev/null || true)
+            label="可升级包清单（apk 无原生 CVE 分类）"
+            ;;
+        pacman)
+            result=$(pacman -Qu 2>/dev/null || true)
+            label="可升级包清单（pacman 无原生 CVE 分类）"
+            ;;
+        *)
+            __SAY__ WARN "当前发行版无原生 CVE 分类支持，跳过 CVE 预扫描"
+            return 0
+            ;;
+    esac
+
+    # 清单落盘供审计
+    if [ -n "${result}" ]; then
+        printf "%s\n" "${result}" | ${__SUDO__} tee "${scan_log}" >/dev/null 2>&1 || true
+        __SAY__ INFO "${label}（已保存 ${scan_log}）："
+        printf "%s\n" "${result}" | head -50 | sed 's/^/    /'
+        local total
+        total=$(printf "%s\n" "${result}" | grep -c . || true)
+        [ "${total}" -gt 50 ] && __SAY__ INFO "  ...共 ${total} 项，完整清单见 ${scan_log}"
+
+        # CVE 清单清理策略：保留最近 ${CVE_KEEP} 份，更早的删除
+        ${__SUDO__} find "${STATE_DIR}/cve" -maxdepth 1 -name 'cve-prescan-*.list' -type f -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn | awk -v keep="${CVE_KEEP}" 'NR>keep{print $2}' \
+            | xargs -r ${__SUDO__} rm -f 2>/dev/null || true
+
+        # 交互模式：询问是否执行安全升级
+        if [ -t 0 ] && [ "${AUTO_FIREWALL}" != "yes" ]; then
+            if __CONFIRM__ "是否立即执行升级？（apt 走全量 upgrade；推荐先审阅清单）" "n"; then
+                __SAY__ INFO "执行升级..."
+                case "${__INSTALL_CMD__}" in
+                    apt-get) ${__SUDO__} apt-get upgrade -y ;;
+                    yum)     ${__SUDO__} yum update -y --security ;;
+                    dnf)     ${__SUDO__} dnf update -y --security ;;
+                    zypper)  ${__SUDO__} zypper patch --category security ;;
+                    apk)     ${__SUDO__} apk upgrade ;;
+                    pacman)  ${__SUDO__} pacman -Syu --noconfirm ;;
+                    *)       __SAY__ WARN "当前包管理器无安全升级路径，请手动升级" ;;
+                esac
+                __SAY__ SUCCESS "升级完成"
+            else
+                __SAY__ INFO "跳过自动升级，请手动审阅清单后决定"
+            fi
+        else
+            __SAY__ WARN "非交互模式不自动升级，请手动审阅 ${scan_log} 后决定"
+        fi
+    else
+        __SAY__ SUCCESS "未发现待修复安全更新"
+    fi
+}
+
+# ==============================================================================
+# 6.6 可选：账户/权限审计（UID0/SUID/SGID/world-writable/sudoers）+ 基线快照
+# ==============================================================================
+__SET_ACCOUNT_AUDIT__() {
+    if ! __ENV_YES__ "${ENABLE_ACCOUNT_AUDIT}"; then
+        __SAY__ INFO "账户/权限审计未启用（ENABLE_ACCOUNT_AUDIT=no；HARDENING_LEVEL=enhanced 自动启用），跳过"
+        return 0
+    fi
+    __SAY__ INFO "执行账户/权限审计..."
+
+    ${__SUDO__} mkdir -p "${AUDIT_SNAPSHOT_DIR}" 2>/dev/null || true
+
+    # --- 1. UID 0 账号（应仅 root） ---
+    local uid0_accounts uid0_count
+    uid0_accounts=$(awk -F: '$3==0{print $1}' /etc/passwd 2>/dev/null || true)
+    uid0_count=$(printf "%s\n" "${uid0_accounts}" | grep -c . || true)
+    if [ "${uid0_count}" -gt 1 ]; then
+        __SAY__ WARN "发现多个 UID 0 账号（应仅 root）: $(echo "${uid0_accounts}" | tr '\n' ' ')"
+    else
+        __SAY__ INFO "UID 0 账号检查通过（仅 root）"
+    fi
+
+    # --- 2. 空密码账户（仅 length($2)==0 为真空密码可无密码登录；!/* 为锁定态，判通过） ---
+    local empty_pwd empty_count
+    empty_pwd=$(${__SUDO__} awk -F: 'length($2)==0{print $1}' /etc/shadow 2>/dev/null || true)
+    empty_count=$(printf "%s\n" "${empty_pwd}" | grep -c . || true)
+    if [ "${empty_count}" -gt 0 ]; then
+        __SAY__ WARN "发现真空密码账户（可无密码登录，高危）: $(echo "${empty_pwd}" | tr '\n' ' ')"
+    else
+        __SAY__ INFO "空密码账户检查通过"
+    fi
+
+    # --- 3. 未锁定的系统账户（UID<1000 非 0 且 shell 非 nologin/false） ---
+    local unlocked_sys unlocked_count
+    unlocked_sys=$(awk -F: '$3<1000 && $3!=0 && $7!~/nologin|false/{print $1":"$7}' /etc/passwd 2>/dev/null || true)
+    unlocked_count=$(printf "%s\n" "${unlocked_sys}" | grep -c . || true)
+    if [ "${unlocked_count}" -gt 0 ]; then
+        __SAY__ WARN "发现未锁定系统账户（有登录 shell）: $(echo "${unlocked_sys}" | tr '\n' ' ')"
+    else
+        __SAY__ INFO "系统账户锁定检查通过"
+    fi
+
+    # --- 4. SUID 文件基线对比 ---
+    local suid_current
+    suid_current=$(${__SUDO__} find / -xdev -perm -4000 -type f 2>/dev/null | sort || true)
+    __AUDIT_BASELINE__ "suid" "${suid_current}"
+
+    # --- 5. SGID 文件基线对比 ---
+    local sgid_current
+    sgid_current=$(${__SUDO__} find / -xdev -perm -2000 -type f 2>/dev/null | sort || true)
+    __AUDIT_BASELINE__ "sgid" "${sgid_current}"
+
+    # --- 6. world-writable 文件（排除 /tmp /var/tmp，基线对比只报新增项） ---
+    local ww_files ww_count
+    ww_files=$(${__SUDO__} find / -xdev -perm -0002 -type f ! -path '/tmp/*' ! -path '/var/tmp/*' 2>/dev/null | sort || true)
+    ww_count=$(printf "%s\n" "${ww_files}" | grep -c . || true)
+    # 全量清单落盘（供审计回溯，不论是否有新增）
+    if [ "${ww_count}" -gt 0 ]; then
+        printf "%s\n" "${ww_files}" | ${__SUDO__} tee "${AUDIT_SNAPSHOT_DIR}/world-writable.txt" >/dev/null 2>&1 || true
+    fi
+    # 基线对比：首次建立基线，后续只对"新增"的 world-writable 发 WARN（复用 __AUDIT_BASELINE__）
+    __AUDIT_BASELINE__ "world-writable" "${ww_files}"
+    if [ "${ww_count}" -eq 0 ]; then
+        __SAY__ INFO "world-writable 文件检查通过"
+    fi
+
+    # --- 7. sudoers 高危配置审计 ---
+    local sudoers_risk
+    sudoers_risk=$(grep -rE 'NOPASSWD.*ALL' /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true)
+    if [ -n "${sudoers_risk}" ]; then
+        __SAY__ WARN "发现 sudoers NOPASSWD:ALL 高危配置:"
+        printf "%s\n" "${sudoers_risk}" | sed 's/^/    /'
+    else
+        __SAY__ INFO "sudoers 高危配置检查通过"
+    fi
+
+    __SAY__ SUCCESS "账户/权限审计完成（基线快照目录: ${AUDIT_SNAPSHOT_DIR}）"
+}
+
+# 辅助：合规报告检查项用的账户审计条件求值（与 __SET_ACCOUNT_AUDIT__ 共享同一逻辑源，避免重复）
+# 用法：__AUDIT_COND__ <uid0|empty_pwd|unlocked_sys|sudoers_all|world_writable>  → 输出 1(通过) 或 0(未通过)
+__AUDIT_COND__() {
+    local key="$1"
+    local n
+    case "${key}" in
+        uid0)
+            # UID 0 仅 root → 行数为 1 即通过
+            n=$(awk -F: '$3==0{print $1}' /etc/passwd 2>/dev/null | grep -c . || true)
+            if [ "${n}" = "1" ]; then echo 1; else echo 0; fi
+            ;;
+        empty_pwd)
+            # 无真空密码账户 → 行数为 0 即通过（!/* 为锁定态，不计）
+            n=$(${__SUDO__} awk -F: 'length($2)==0{print $1}' /etc/shadow 2>/dev/null | grep -c . || true)
+            if [ "${n}" = "0" ]; then echo 1; else echo 0; fi
+            ;;
+        unlocked_sys)
+            # 无未锁定系统账户 → 行数为 0 即通过
+            n=$(awk -F: '$3<1000 && $3!=0 && $7!~/nologin|false/{print $1}' /etc/passwd 2>/dev/null | grep -c . || true)
+            if [ "${n}" = "0" ]; then echo 1; else echo 0; fi
+            ;;
+        sudoers_all)
+            # 无 NOPASSWD:ALL 即通过（grep 单命令，非管道，无 pipefail 陷阱）
+            if grep -rqE 'NOPASSWD.*ALL' /etc/sudoers /etc/sudoers.d/ 2>/dev/null; then
+                echo 0
+            else
+                echo 1
+            fi
+            ;;
+        world_writable)
+            # 与 __SET_ACCOUNT_AUDIT__ 基线对比语义对齐：
+            #   - 基线存在时：相对基线无新增即通过（comm -23 当前 基线 为空）
+            #   - 基线不存在时（ENABLE_ACCOUNT_AUDIT=no 或首次未跑审计）：退化为"无 world-writable 即通过"
+            local ww_base ww_cur added
+            ww_base="${AUDIT_SNAPSHOT_DIR}/world-writable-baseline.txt"
+            ww_cur=$(${__SUDO__} find / -xdev -perm -0002 -type f ! -path '/tmp/*' ! -path '/var/tmp/*' 2>/dev/null | sort || true)
+            if [ -f "${ww_base}" ]; then
+                # 有新增项则 FAIL
+                added=$(comm -23 <(printf "%s\n" "${ww_cur}") "${ww_base}" 2>/dev/null | grep -c . || true)
+                if [ "${added}" = "0" ]; then echo 1; else echo 0; fi
+            else
+                # 无基线：退化为绝对判定
+                if [ "$(printf "%s\n" "${ww_cur}" | grep -c . || true)" = "0" ]; then echo 1; else echo 0; fi
+            fi
+            ;;
+        *)
+            echo 0
+            ;;
+    esac
+}
+
+# 辅助：SUID/SGID 基线对比（首次建立基线，后续比对新增项）
+# 用法：__AUDIT_BASELINE__ <类型: suid|sgid> <当前清单>
+__AUDIT_BASELINE__() {
+    local type="$1" current="$2"
+    local baseline_file="${AUDIT_SNAPSHOT_DIR}/${type}-baseline.txt"
+
+    if [ -f "${baseline_file}" ]; then
+        # 与基线对比，找出新增项
+        local added
+        added=$(comm -23 <(printf "%s\n" "${current}") "${baseline_file}" 2>/dev/null || true)
+        local removed
+        removed=$(comm -13 <(printf "%s\n" "${current}") "${baseline_file}" 2>/dev/null || true)
+        if [ -n "${added}" ]; then
+            __SAY__ WARN "新增 ${type} 文件（相对基线）:"
+            printf "%s\n" "${added}" | sed 's/^/    /'
+        fi
+        if [ -n "${removed}" ]; then
+            __SAY__ INFO "已移除 ${type} 文件（相对基线）:"
+            printf "%s\n" "${removed}" | sed 's/^/    /'
+        fi
+        if [ -z "${added}" ] && [ -z "${removed}" ]; then
+            __SAY__ INFO "${type} 文件清单与基线一致"
+        fi
+    else
+        # 首次运行：建立基线
+        printf "%s\n" "${current}" | ${__SUDO__} tee "${baseline_file}" >/dev/null 2>&1 || true
+        __SAY__ INFO "首次运行：已建立 ${type} 基线快照（${baseline_file}）"
+    fi
+}
+
+# ==============================================================================
+# 7.6 合规报告（CIS 检查项清单 + 通过/未通过，支持 text/json 输出）
+# ==============================================================================
+# JSON 字符串转义（纯 bash，处理 \ " 换行 制表符）
+__JSON_ESCAPE__() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "${s}"
+}
+
 __COMPLIANCE_REPORT__() {
+    # __SAY__ 已统一走 stderr（诊断流），stdout 留给 JSON 数据输出，无需重定向
     __SAY__ INFO "生成合规检查报告（CIS 基线检查项）..."
 
     local pass=0 fail=0
-    local -a report=()
+    local -a report_text=()
+    local -a report_json=()
 
-    # 辅助：单行检查项（条件为真则 PASS，否则 FAIL）
+    # 辅助：单行检查项（条件为真则 PASS，否则 FAIL），并行维护 text/json 两数组
     __CHECK__() {
         local item="$1" cond="$2"
+        local status passed
         if [ "${cond}" = "1" ]; then
+            status="PASS"; passed="true"
             pass=$((pass+1))
-            report+=("  [PASS] ${item}")
         else
+            status="FAIL"; passed="false"
             fail=$((fail+1))
-            report+=("  [FAIL] ${item}")
         fi
+        report_text+=("  [${status}] ${item}")
+        report_json+=("{\"name\":\"$(__JSON_ESCAPE__ "${item}")\",\"passed\":${passed},\"status\":\"${status}\"}")
     }
 
     # --- 检查项 ---
@@ -1447,7 +1750,7 @@ __COMPLIANCE_REPORT__() {
     __CHECK__ "SSH 禁用密码认证" \
         "$(echo "${sshd_effective}" | grep -qE "^passwordauthentication\s+no" && echo 1 || echo 0)"
     __CHECK__ "SSH 禁用 root 密码登录" \
-        "$(echo "${sshd_effective}" | grep -qE "^permitrootlogin\s+prohibit-password" && echo 1 || echo 0)"
+        "$(echo "${sshd_effective}" | grep -qE "^permitrootlogin\s+(prohibit-password|without-password)" && echo 1 || echo 0)"
 
     # 5. 防火墙
     __CHECK__ "ufw 防火墙已启用" \
@@ -1465,17 +1768,42 @@ __COMPLIANCE_REPORT__() {
     __CHECK__ "内核模块禁用配置" \
         "$([ -f /etc/modprobe.d/sysinit-hardening.conf ] && echo 1 || echo 0)"
 
+    # 9. 账户/权限审计扩展项（CIS Level 1）—— 复用 __AUDIT_COND__，与 __SET_ACCOUNT_AUDIT__ 共享同一判定逻辑
+    __CHECK__ "UID 0 账号仅 root"            "$(__AUDIT_COND__ uid0)"
+    __CHECK__ "无空密码账户"                 "$(__AUDIT_COND__ empty_pwd)"
+    __CHECK__ "无未锁定系统账户"             "$(__AUDIT_COND__ unlocked_sys)"
+    __CHECK__ "sudoers 无 NOPASSWD:ALL"      "$(__AUDIT_COND__ sudoers_all)"
+    __CHECK__ "/etc/sudoers 权限 440" \
+        "$([ "$(stat -c %a /etc/sudoers 2>/dev/null)" = "440" ] && echo 1 || echo 0)"
+    __CHECK__ "无 world-writable 文件 (排除/tmp)" "$(__AUDIT_COND__ world_writable)"
+
     # 输出报告
-    echo ""
-    __SAY__ INFO "========== 合规检查报告 (CIS 基线) =========="
-    printf "%s\n" "${report[@]}"
-    echo ""
-    __SAY__ INFO "通过: ${pass}  未通过: ${fail}  总计: $((pass+fail))"
-    if [ "${fail}" -gt 0 ]; then
-        __SAY__ WARN "存在未通过项，建议按上方 [FAIL] 项逐条排查"
-    else
-        __SAY__ SUCCESS "全部检查项通过"
-    fi
+    case "${REPORT_FORMAT}" in
+        json|JSON)
+            # 纯 stdout 输出 JSON（__SAY__ 已统一走 stderr，stdout 干净）
+            local ts
+            ts=$(date +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date +%s)
+            printf '{"timestamp":"%s","checks":[' "${ts}"
+            local first=1 i
+            for ((i=0; i<${#report_json[@]}; i++)); do
+                [ "${first}" -eq 1 ] && first=0 || printf ','
+                printf '%s' "${report_json[i]}"
+            done
+            printf '],"summary":{"pass":%d,"fail":%d,"total":%d}}\n' "${pass}" "${fail}" "$((pass+fail))"
+            ;;
+        *)
+            echo ""
+            __SAY__ INFO "========== 合规检查报告 (CIS 基线) =========="
+            printf "%s\n" "${report_text[@]}"
+            echo ""
+            __SAY__ INFO "通过: ${pass}  未通过: ${fail}  总计: $((pass+fail))"
+            if [ "${fail}" -gt 0 ]; then
+                __SAY__ WARN "存在未通过项，建议按上方 [FAIL] 项逐条排查"
+            else
+                __SAY__ SUCCESS "全部检查项通过"
+            fi
+            ;;
+    esac
 }
 
 __SET_DISABLE_SERVICES__() {
@@ -1943,6 +2271,168 @@ __SET_DATA_DIRS__() {
 
 
 # ==============================================================================
+# 7.7 交互式配置引导（等级选择 → 钻取微调 → 业务模块 → 确认）
+# 仅 TTY 且未设 AUTO_FIREWALL/AUTO_SSH 且非 dry-run 时触发；其余情况直接 return
+# ==============================================================================
+# 全局标志：交互引导是否实际运行过（供 __PRINT_EQUIV_CMD__ 判断是否打印等价命令）
+__INTERACTIVE_RAN__=""
+
+# 辅助：把 yes/no 归一为 __CONFIRM__ 的默认值 y/n
+__YESNO_TO_YN__() {
+    if __ENV_YES__ "${1:-no}"; then echo "y"; else echo "n"; fi
+}
+
+# 辅助：on/off 显示
+__YESNO_TO_ONOFF__() {
+    if __ENV_YES__ "${1:-no}"; then echo "on"; else echo "off"; fi
+}
+
+__INTERACTIVE_CONFIG__() {
+    # 触发条件：TTY 且非非交互意图 且非预演
+    if [ ! -t 0 ] || [ "${AUTO_FIREWALL}" = "yes" ] || [ "${AUTO_SSH}" = "yes" ] || [ -n "${__DRY_RUN__}" ]; then
+        return 0
+    fi
+    __INTERACTIVE_RAN__="1"
+    local C="\033[1;36m" B="\033[1m" R="\033[0m" Y="\033[1;33m" G="\033[0;32m"
+
+    # ---------- Step 1：等级选择（1/2/3 数字菜单） ----------
+    printf "\n"
+    __SAY__ INFO "========== 加固等级选择 =========="
+    # 预填用户原值 → 转为默认序号
+    local level_default=2
+    case "${HARDENING_LEVEL:-}" in
+        minimal)  level_default=1 ;;
+        standard) level_default=2 ;;
+        enhanced) level_default=3 ;;
+    esac
+    printf "  ${C}1${R}) ${B}minimal${R}  - 仅基础加固（内核/umask/SSH/防火墙，~2 分钟）\n"
+    printf "  ${C}2${R}) ${B}standard${R} - +auditd/modprobe黑名单/fail2ban/journald（~5 分钟）\n"
+    printf "  ${C}3${R}) ${B}enhanced${R} - +安全工具(rkhunter/clamav/lynis)/nginx头/CVE扫描/账户审计\n"
+    printf "             ${Y}⚠ enhanced 会安装 clamav，首次 freshclam 较慢，整体 ~10-15 分钟${R}\n"
+    printf "\n"
+
+    local level_input
+    while true; do
+        level_input=$(__PROMPT__ "选择加固等级 [1-3]" "${level_default}")
+        case "${level_input}" in
+            1|minimal)   HARDENING_LEVEL="minimal";  break ;;
+            2|standard)  HARDENING_LEVEL="standard"; break ;;
+            3|enhanced)  HARDENING_LEVEL="enhanced"; break ;;
+            *) __SAY__ WARN "无效选择: ${level_input}（请输入 1、2 或 3）" ;;
+        esac
+    done
+
+    # ---------- Step 2：应用等级映射，列出将启用模块，钻取确认 ----------
+    __APPLY_HARDENING_LEVEL__
+
+    local sec_on=""
+    __ENV_YES__ "${ENABLE_AUDITD}"          && sec_on="${sec_on}auditd, "
+    __ENV_YES__ "${ENABLE_MODPROBE_HARDEN}" && sec_on="${sec_on}modprobe黑名单, "
+    __ENV_YES__ "${ENABLE_FAIL2BAN}"        && sec_on="${sec_on}fail2ban, "
+    __ENV_YES__ "${ENABLE_JOURNALD}"        && sec_on="${sec_on}journald, "
+    __ENV_YES__ "${ENABLE_SECURITY_TOOLS}"  && sec_on="${sec_on}安全工具, "
+    __ENV_YES__ "${ENABLE_NGINX_HARDEN}"    && sec_on="${sec_on}nginx头, "
+    __ENV_YES__ "${ENABLE_UNATTENDED}"      && sec_on="${sec_on}unattended, "
+    __ENV_YES__ "${ENABLE_CVE_SCAN}"        && sec_on="${sec_on}CVE扫描, "
+    __ENV_YES__ "${ENABLE_ACCOUNT_AUDIT}"   && sec_on="${sec_on}账户审计, "
+    # 去掉末尾的 ", "
+    sec_on="${sec_on%, }"
+    __SAY__ INFO "将启用的安全模块: ${sec_on:-（无，minimal 等级）}"
+
+    if __CONFIRM__ "是否要在此基础上微调这些模块?" "n"; then
+        # 钻取：9 个安全模块逐项问，默认值=当前等级映射值
+        __CONFIRM__ "启用 auditd（系统级审计）?"                         "$(__YESNO_TO_YN__ "${ENABLE_AUDITD}")"          && ENABLE_AUDITD=yes          || ENABLE_AUDITD=no
+        __CONFIRM__ "启用 modprobe 黑名单（禁用高风险内核模块）?"        "$(__YESNO_TO_YN__ "${ENABLE_MODPROBE_HARDEN}")" && ENABLE_MODPROBE_HARDEN=yes || ENABLE_MODPROBE_HARDEN=no
+        __CONFIRM__ "启用 fail2ban（sshd 防爆破）?"                      "$(__YESNO_TO_YN__ "${ENABLE_FAIL2BAN}")"        && ENABLE_FAIL2BAN=yes        || ENABLE_FAIL2BAN=no
+        __CONFIRM__ "启用 journald 持久化（256M/30天）?"                 "$(__YESNO_TO_YN__ "${ENABLE_JOURNALD}")"        && ENABLE_JOURNALD=yes        || ENABLE_JOURNALD=no
+        __CONFIRM__ "启用 安全工具(rkhunter/clamav/lynis，较重）?"       "$(__YESNO_TO_YN__ "${ENABLE_SECURITY_TOOLS}")"  && ENABLE_SECURITY_TOOLS=yes  || ENABLE_SECURITY_TOOLS=no
+        __CONFIRM__ "启用 nginx 安全头（检测到 nginx 时应用）?"          "$(__YESNO_TO_YN__ "${ENABLE_NGINX_HARDEN}")"    && ENABLE_NGINX_HARDEN=yes    || ENABLE_NGINX_HARDEN=no
+        __CONFIRM__ "启用 unattended 自动安全更新?"                      "$(__YESNO_TO_YN__ "${ENABLE_UNATTENDED}")"      && ENABLE_UNATTENDED=yes      || ENABLE_UNATTENDED=no
+        __CONFIRM__ "启用 CVE 预扫描?"                                    "$(__YESNO_TO_YN__ "${ENABLE_CVE_SCAN}")"        && ENABLE_CVE_SCAN=yes        || ENABLE_CVE_SCAN=no
+        __CONFIRM__ "启用 账户/权限审计?"                                 "$(__YESNO_TO_YN__ "${ENABLE_ACCOUNT_AUDIT}")"   && ENABLE_ACCOUNT_AUDIT=yes   || ENABLE_ACCOUNT_AUDIT=no
+    fi
+
+    # ---------- Step 3：业务模块独立引导区块（4 个，默认保守 no） ----------
+    printf "\n"
+    __SAY__ INFO "========== 业务相关配置 =========="
+    printf "  ${C}SWAP${R}             创建 swapfile（可改 SWAP_SIZE，如 4G/8G）\n"
+    printf "  ${C}DISABLE_IPV6${R}     全链路关闭 IPv6（sysctl+ufw+sshd+nginx）\n"
+    printf "  ${C}CREATE_DATA_DIRS${R} 创建 /data 业务目录结构（apps/scripts/backups/creds）\n"
+    printf "  ${C}SYSSTAT${R}          安装 sar 系统活动采集\n"
+    printf "\n"
+
+    if __CONFIRM__ "启用 SWAP（创建 swapfile）?" "$(__YESNO_TO_YN__ "${ENABLE_SWAP}")"; then
+        ENABLE_SWAP=yes
+        local swap_size_input
+        while true; do
+            swap_size_input=$(__PROMPT__ "swap 大小（如 4G/8G）" "${SWAP_SIZE}")
+            # 接受大小写 G/M，归一化为大写
+            if [[ "${swap_size_input}" =~ ^[0-9]+[GgMm]$ ]]; then
+                SWAP_SIZE="${swap_size_input^^}"; break
+            fi
+            __SAY__ WARN "无效大小: ${swap_size_input}（格式如 4G 或 8G）"
+        done
+    else
+        ENABLE_SWAP=no
+    fi
+
+    if __CONFIRM__ "关闭 IPv6（DISABLE_IPV6）?" "$(__YESNO_TO_YN__ "${DISABLE_IPV6}")"; then
+        DISABLE_IPV6=yes
+    else
+        DISABLE_IPV6=no
+    fi
+
+    if __CONFIRM__ "创建 /data 业务目录结构?" "$(__YESNO_TO_YN__ "${CREATE_DATA_DIRS}")"; then
+        CREATE_DATA_DIRS=yes
+    else
+        CREATE_DATA_DIRS=no
+    fi
+
+    if __CONFIRM__ "安装 sysstat（sar 系统活动采集）?" "$(__YESNO_TO_YN__ "${ENABLE_SYSSTAT}")"; then
+        ENABLE_SYSSTAT=yes
+    else
+        ENABLE_SYSSTAT=no
+    fi
+
+    # ---------- Step 4：确认汇总（取消则 exit 0） ----------
+    printf "\n"
+    __SAY__ INFO "========== 配置确认 =========="
+    __SAY__ INFO "加固等级: ${HARDENING_LEVEL}"
+    __SAY__ INFO "安全模块: auditd=$(__YESNO_TO_ONOFF__ "${ENABLE_AUDITD}") modprobe=$(__YESNO_TO_ONOFF__ "${ENABLE_MODPROBE_HARDEN}") fail2ban=$(__YESNO_TO_ONOFF__ "${ENABLE_FAIL2BAN}") journald=$(__YESNO_TO_ONOFF__ "${ENABLE_JOURNALD}") sec_tools=$(__YESNO_TO_ONOFF__ "${ENABLE_SECURITY_TOOLS}") nginx=$(__YESNO_TO_ONOFF__ "${ENABLE_NGINX_HARDEN}") unattended=$(__YESNO_TO_ONOFF__ "${ENABLE_UNATTENDED}") cve_scan=$(__YESNO_TO_ONOFF__ "${ENABLE_CVE_SCAN}") acct_audit=$(__YESNO_TO_ONOFF__ "${ENABLE_ACCOUNT_AUDIT}")"
+    __SAY__ INFO "业务模块: SWAP=$(__YESNO_TO_ONOFF__ "${ENABLE_SWAP}") IPV6_OFF=$(__YESNO_TO_ONOFF__ "${DISABLE_IPV6}") DATA_DIRS=$(__YESNO_TO_ONOFF__ "${CREATE_DATA_DIRS}") SYSSTAT=$(__YESNO_TO_ONOFF__ "${ENABLE_SYSSTAT}")"
+
+    if ! __CONFIRM__ "确认按以上配置执行?" "y"; then
+        __SAY__ WARN "用户取消执行（未做任何系统改动）"
+        __CLEANUP_TMP__
+        exit 0
+    fi
+}
+
+# 辅助：打印本次交互选择的等价非交互命令（便于复现到 CI/批量部署）
+__PRINT_EQUIV_CMD__() {
+    [ -z "${__INTERACTIVE_RAN__}" ] && return 0
+    local cmd="HARDENING_LEVEL=${HARDENING_LEVEL}"
+    cmd="${cmd} ENABLE_SWAP=${ENABLE_SWAP}"
+    [ "${ENABLE_SWAP}" = "yes" ] && cmd="${cmd} SWAP_SIZE=${SWAP_SIZE}"
+    cmd="${cmd} DISABLE_IPV6=${DISABLE_IPV6}"
+    cmd="${cmd} CREATE_DATA_DIRS=${CREATE_DATA_DIRS}"
+    cmd="${cmd} ENABLE_SYSSTAT=${ENABLE_SYSSTAT}"
+    cmd="${cmd} ENABLE_AUDITD=${ENABLE_AUDITD}"
+    cmd="${cmd} ENABLE_MODPROBE_HARDEN=${ENABLE_MODPROBE_HARDEN}"
+    cmd="${cmd} ENABLE_FAIL2BAN=${ENABLE_FAIL2BAN}"
+    cmd="${cmd} ENABLE_JOURNALD=${ENABLE_JOURNALD}"
+    cmd="${cmd} ENABLE_SECURITY_TOOLS=${ENABLE_SECURITY_TOOLS}"
+    cmd="${cmd} ENABLE_NGINX_HARDEN=${ENABLE_NGINX_HARDEN}"
+    cmd="${cmd} ENABLE_UNATTENDED=${ENABLE_UNATTENDED}"
+    cmd="${cmd} ENABLE_CVE_SCAN=${ENABLE_CVE_SCAN}"
+    cmd="${cmd} ENABLE_ACCOUNT_AUDIT=${ENABLE_ACCOUNT_AUDIT}"
+    cmd="${cmd} AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh"
+    __SAY__ INFO "等价非交互命令（可复制到 CI/批量部署复现本次选择）:"
+    __SAY__ INFO "  ${cmd}"
+}
+
+
+# ==============================================================================
 # 8. 执行主干与报告检查
 # ==============================================================================
 __MAIN__() {
@@ -1966,22 +2456,24 @@ __MAIN__() {
     __SAY__ INFO "执行日志: ${__LOG_FILE__}"
     __SAY__ INFO "配置备份目录: ${BACKUP_DIR}"
     __BANNER__
+    __INTERACTIVE_CONFIG__
     __APPLY_HARDENING_LEVEL__
     __SAY__ INFO "可选模块: SWAP=${ENABLE_SWAP} FAIL2BAN=${ENABLE_FAIL2BAN} IPV6_OFF=${DISABLE_IPV6} JOURNALD=${ENABLE_JOURNALD} UNATTENDED=${ENABLE_UNATTENDED} SYSSTAT=${ENABLE_SYSSTAT} DATA_DIRS=${CREATE_DATA_DIRS}"
-    __SAY__ INFO "安全模块: AUDITD=${ENABLE_AUDITD} MODPROBE=${ENABLE_MODPROBE_HARDEN} SEC_TOOLS=${ENABLE_SECURITY_TOOLS} NGINX=${ENABLE_NGINX_HARDEN} LEVEL=${HARDENING_LEVEL:-none}"
+    __SAY__ INFO "安全模块: AUDITD=${ENABLE_AUDITD} MODPROBE=${ENABLE_MODPROBE_HARDEN} SEC_TOOLS=${ENABLE_SECURITY_TOOLS} NGINX=${ENABLE_NGINX_HARDEN} CVE_SCAN=${ENABLE_CVE_SCAN} ACCT_AUDIT=${ENABLE_ACCOUNT_AUDIT} LEVEL=${HARDENING_LEVEL:-none}"
 
     # 预演模式：仅检测环境并打印计划，不修改系统（跳过 precheck 标记检查）
     if [ -n "${__DRY_RUN__}" ]; then
         __SAY__ INFO "========== 预演模式 (--dry-run)：仅检测，不修改系统 =========="
         __SAY__ INFO "将按以下顺序执行（与实际运行一致）："
         echo "  1. 基础系统属性设置        : __SET_HOSTNAME__ / __SET_SOURCEREPO__"
-        echo "  2. 基础依赖包更新与安装    : __BASIC_INSTALL__（含 sysstat/unattended 可选模块）"
-        echo "  3. 服务发现 + SELinux + 防火墙 : __SERVICE_DISCOVERY__ / __SET_SELINUX__ / __SET_UFW__"
-        echo "  4. 内核性能调优 + 安全基线 : __SET_KERN_OPTIMIZE__"
-        echo "  5. Dev-Sec OS 基线加固     : __SET_DEVSEC_OS_HARDEN__（umask/密码/账户/权限）"
-        echo "  6. 时区 + 审计 + 安全模块  : __SET_TIMEZONE__ / __SET_CMDAUDIT__ / __SET_AUDITD__ / __SET_MODPROBE_HARDEN__ / __SET_SECURITY_TOOLS__ / __SET_DISABLE_SERVICES__"
-        echo "  7. SSH 加固 + 可选模块     : __SET_SSHD_CONFIG__ / __SET_DISABLE_IPV6__ / __SET_SWAP__ / __SET_FAIL2BAN__ / __SET_JOURNALD__ / __SET_NGINX_HARDEN__ / __SET_DATA_DIRS__"
-        echo "  8. 合规报告                : __COMPLIANCE_REPORT__"
+        echo "  2. CVE 预扫描             : __SET_CVE_SCAN__（先于升级决策，出待修复安全更新清单）"
+        echo "  3. 基础依赖包更新与安装    : __BASIC_INSTALL__（含 sysstat/unattended 可选模块）"
+        echo "  4. 服务发现 + SELinux + 防火墙 : __SERVICE_DISCOVERY__ / __SET_SELINUX__ / __SET_UFW__"
+        echo "  5. 内核性能调优 + 安全基线 : __SET_KERN_OPTIMIZE__"
+        echo "  6. Dev-Sec OS 基线加固     : __SET_DEVSEC_OS_HARDEN__（umask/密码/账户/权限）"
+        echo "  7. 时区 + 审计 + 安全模块  : __SET_TIMEZONE__ / __SET_CMDAUDIT__ / __SET_AUDITD__ / __SET_MODPROBE_HARDEN__ / __SET_SECURITY_TOOLS__ / __SET_ACCOUNT_AUDIT__ / __SET_DISABLE_SERVICES__"
+        echo "  8. SSH 加固 + 可选模块     : __SET_SSHD_CONFIG__ / __SET_DISABLE_IPV6__ / __SET_SWAP__ / __SET_FAIL2BAN__ / __SET_JOURNALD__ / __SET_NGINX_HARDEN__ / __SET_DATA_DIRS__"
+        echo "  9. 合规报告                : __COMPLIANCE_REPORT__（REPORT_FORMAT=${REPORT_FORMAT}）"
         echo ""
         __SAY__ INFO "预演完成。如需实际执行，请去掉 --dry-run 参数运行。"
         __CLEANUP_TMP__
@@ -1992,24 +2484,27 @@ __MAIN__() {
     __SECTION__ "1. 基础系统属性设置"
     __SET_HOSTNAME__
     __SET_SOURCEREPO__
-    __SECTION__ "2. 基础依赖包更新与安装"
+    __SECTION__ "2. CVE 预扫描（待修复安全更新清单，先于升级决策）"
+    __SET_CVE_SCAN__
+    __SECTION__ "3. 基础依赖包更新与安装"
     __BASIC_INSTALL__
-    __SECTION__ "3. SELinux 与防火墙设置"
+    __SECTION__ "4. SELinux 与防火墙设置"
     __SERVICE_DISCOVERY__
     __SET_SELINUX__
     __SET_UFW__
-    __SECTION__ "4. 核心优化：高并发性能调优 + Dev-Sec 内核安全基线"
+    __SECTION__ "5. 核心优化：高并发性能调优 + Dev-Sec 内核安全基线"
     __SET_KERN_OPTIMIZE__
-    __SECTION__ "5. Dev-Sec OS 基线专项安全加固"
+    __SECTION__ "6. Dev-Sec OS 基线专项安全加固"
     __SET_DEVSEC_OS_HARDEN__
-    __SECTION__ "6. 系统时区与审计服务配置"
+    __SECTION__ "7. 系统时区与审计服务配置"
     __SET_TIMEZONE__
     __SET_CMDAUDIT__
     __SET_AUDITD__
     __SET_MODPROBE_HARDEN__
     __SET_SECURITY_TOOLS__
+    __SET_ACCOUNT_AUDIT__
     __SET_DISABLE_SERVICES__
-    __SECTION__ "7. Dev-Sec SSH 加固与防锁死配置"
+    __SECTION__ "8. Dev-Sec SSH 加固与防锁死配置"
     __SET_SSHD_CONFIG__
     __SET_DISABLE_IPV6__
     __SET_SWAP__
@@ -2019,15 +2514,16 @@ __MAIN__() {
     __SET_DATA_DIRS__
     __COMPLIANCE_REPORT__
 
-    # 所有步骤成功后写入初始化标记
-    ${__SUDO__} mkdir -p /opt
-    ${__SUDO__} tee "/opt/.server.init.executed" >/dev/null <<EOF
+    # 所有步骤成功后写入初始化标记（收敛到 STATE_DIR）
+    ${__SUDO__} mkdir -p "${STATE_DIR}"
+    ${__SUDO__} tee "${STATE_DIR}/.executed" >/dev/null <<EOF
 sysinit $(date +%Y%m%d%H%M%S)
 EOF
 
     __SAY__ SUCCESS "================ 优化结束！系统安全基线已全面加固 =================="
     __SAY__ INFO "执行日志已保存: ${__LOG_FILE__}"
     __SAY__ INFO "配置备份目录: ${BACKUP_DIR}"
+    __SAY__ INFO "状态根目录: ${STATE_DIR}（执行标记/审计基线/CVE清单）"
     if [ -n "${__INSTALL_FAILED_PKGS__}" ]; then
         __SAY__ WARN "以下包安装失败，需手工补装: ${__INSTALL_FAILED_PKGS__}"
     fi
@@ -2035,6 +2531,9 @@ EOF
     if __ENV_YES__ "${AUTO_SSH}"; then
         __SAY__ WARN "SSH 已加固为仅密钥登录（PasswordAuthentication no / PermitRootLogin prohibit-password）：请先确认已配置公钥再断开当前会话"
     fi
+
+    # 交互模式：打印本次选择的等价非交互命令，便于复现到 CI/批量部署
+    __PRINT_EQUIV_CMD__
 
     __CLEANUP_TMP__
 }

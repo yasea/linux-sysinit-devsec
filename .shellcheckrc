@@ -1,0 +1,9 @@
+# sysinit.sh shellcheck 排除规则
+# 以下 SC 编号在脚本中为有意为之，非缺陷：
+disable=SC2034,SC2155,SC2086,SC1090,SC1091,SC2230,SC2317
+# SC2034: ": "${VAR:=}" 环境变量占位供外部消费，脚本内未读
+# SC2155: "local x=$(...) 局部赋值+命令替换，脚本多处有意为之
+# SC2086: "__INSTALL_CMD__ 故意 word splitting 传包名
+# SC1090/SC1091: source 动态文件（os-release 等）
+# SC2230: command -v 路径检查风格
+# SC2317: ERR trap 引用的 __ERR_HANDLER__ 被判不可达
