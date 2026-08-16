@@ -32,8 +32,8 @@ Linux 服务器快速初始化、性能调优与 Dev-Sec 安全基线加固脚�
 | **modprobe 黑名单** | 禁用高风险内核模块（cramfs/dccp/sctp/hfs 等） | — | `ENABLE_MODPROBE_HARDEN` |
 | **安全工具** | rkhunter/clamav/lynis + 自动化扫描 cron | — | `ENABLE_SECURITY_TOOLS` |
 | **nginx 安全头** | 检测到 nginx 时应用安全响应头 | — | `ENABLE_NGINX_HARDEN` |
-| **CVE 预扫描** | 升级前出待修复安全更新清单（apt/dnf updateinfo/zypper 等），交互确认是否升级 | ✅ 交互确认 | `ENABLE_CVE_SCAN` |
-| **账户/权限审计** | UID0/SUID/SGID/world-writable/sudoers 扫描 + 基线快照对比 | — | `ENABLE_ACCOUNT_AUDIT` |
+| **CVE 预扫描** | 升级前出待升级清单（apt 全量 upgrade 模拟/dnf updateinfo/zypper 等，apt 无原生 CVE 分类如实标注），交互确认是否升级 | ✅ 交互确认 | `ENABLE_CVE_SCAN` |
+| **账户/权限审计** | UID0/空密码/未锁系统账户/SUID/SGID/world-writable/sudoers 扫描 + SUID/SGID/world-writable 基线快照对比 | — | `ENABLE_ACCOUNT_AUDIT` |
 | **服务发现** | 扫描监听端口 + 推断 enabled 服务端口 + 用户确认"不可触碰" | ✅ **交互式确认** | `EXTRA_ALLOW_PORTS` |
 | **分级加固** | `minimal`/`standard`/`enhanced` 一键启用对应安全模块 | — | `HARDENING_LEVEL` |
 | **合规报告** | CIS 基线检查项 18 项，支持 `text`/`json` 输出 | — | `REPORT_FORMAT` |
@@ -97,6 +97,8 @@ AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
 | `CREATE_DATA_DIRS` | `no` | 设为 `yes` 创建 `/data` 业务目录结构 |
 | `STATE_DIR` | `/var/lib/sysinit` | 运行时状态根目录（执行标记/审计基线/CVE清单） |
 | `BACKUP_DIR` | `/var/lib/sysinit/backups` | 配置文件修改备份目录 |
+| `BACKUP_KEEP` | `10` | 每个源文件保留的备份份数（超出按时间倒序删除） |
+| `CVE_KEEP` | `10` | CVE 预扫描清单保留份数（超出按时间倒序删除） |
 | `LOG_DIR` | `/var/log/sysinit` | 执行日志保存目录（保留在 /var/log 下兼容系统日志工具） |
 | `LOG_LEVEL` | `INFO` | 日志级别：`INFO` / `WARN` / `ERROR` / `DEBUG` |
 
@@ -198,9 +200,10 @@ HARDENING_LEVEL=standard ENABLE_SWAP=no DISABLE_IPV6=no ... AUTO_FIREWALL=yes AU
     - `.executed` — 初始化完成标记
     - 日志保留在 `/var/log/sysinit/`（兼容系统日志工具轮转）
     - 并发锁保留在 `/var/lock/sysinit.lock`（FHS 锁文件约定）
-11. **CVE 预扫描**：非交互模式不自动升级，只打印清单并保存到 `${STATE_DIR}/cve/cve-prescan-<时间戳>.list`；交互模式询问后再升级。
-12. **账户审计基线**：首次运行建立 SUID/SGID 基线快照（`${AUDIT_SNAPSHOT_DIR}`），后续运行对比基线列出新增/移除项。
+11. **CVE 预扫描**：非交互模式不自动升级，只打印清单并保存到 `${STATE_DIR}/cve/cve-prescan-<时间戳>.list`（按 `CVE_KEEP` 保留份数自动清理）；交互模式询问后再升级。apt 系无原生 CVE 分类，清单为全量 upgrade 模拟结果（含安全与非安全更新），标签如实标注。
+12. **账户审计基线**：首次运行建立 SUID/SGID/world-writable 基线快照（`${AUDIT_SNAPSHOT_DIR}`），后续运行对比基线仅列出新增/移除项（world-writable 同样按基线对比，避免系统默认项噪音）。
 13. **JSON 输出**：`__SAY__` 日志统一走 stderr（诊断流），`REPORT_FORMAT=json` 时 stdout 仅含 JSON，可直接 `| jq .` 无需过滤。
+14. **备份清理**：每个被修改的源文件在 `BACKUP_DIR` 仅保留最近 `BACKUP_KEEP` 份备份，超出按时间倒序删除。
 
 ## 文件结构
 
@@ -261,7 +264,7 @@ sha256sum -c sysinit.sh.sha256sum
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
-| 2.4.0 | 2026-08-16 | **交互式配置引导**：TTY 模式下新增四级交互（加固等级选择→钻取微调→业务模块配置→配置确认），覆盖此前只能靠环境变量的 13 个可选模块；钻取微调可逐项开关 8 个安全模块，业务模块独立引导区块问 SWAP/IPv6/数据目录/sysstat；执行结尾打印等价非交互命令便于复现到 CI/批量部署；取消执行干净退出 `exit 0` |
+| 2.4.0 | 2026-08-16 | **交互式配置引导**：TTY 模式下新增四级交互（加固等级选择→钻取微调→业务模块配置→配置确认），覆盖此前只能靠环境变量的 13 个可选模块；钻取微调可逐项开关 8 个安全模块，业务模块独立引导区块问 SWAP/IPv6/数据目录/sysstat；执行结尾打印等价非交互命令便于复现到 CI/批量部署；取消执行干净退出 `exit 0`。**审计稳定性修复**：空密码审计仅认 `length($2)==0`（锁定态 `!`/`*` 不再误报）、SSH `PermitRootLogin` 兼容 `without-password` 别名、`__AUDIT_COND__` 重构避 `pipefail` 子 shell 陷阱（合规 14→17 PASS）、world-writable 改基线对比只报新增项、备份/CVE 清单清理参数化（`BACKUP_KEEP`/`CVE_KEEP`）、`__PROMPT__` 修复 ssh pty 回读死循环、SWAP_SIZE 校验接受小写、CVE 升级语义诚实化（apt 无原生 CVE 分类） |
 | 2.3.2 | 2026-08-16 | **安全扫描与工程可靠性增强**：CVE 漏洞预扫描（apt/dnf updateinfo/zypper/apk/pacman，交互确认是否升级）、账户/权限审计（UID0/空密码/未锁系统账户/SUID/SGID/world-writable/sudoers）+ SUID/SGID 基线快照对比、合规报告扩展至 18 项 CIS Level 1 + 支持 `REPORT_FORMAT=json` 结构化输出、shellcheck CI workflow、release 签名流程文档；`HARDENING_LEVEL=enhanced` 自动启用 CVE 扫描与账户审计 |
 | 2.3.1 | 2026-08-15 | **代码审计修复**：合规报告 `sshd -T` 改单次执行+`|| true` 兜底（避免 `set -e` 退出）、服务发现端口提取管道补 `|| true`（`pipefail` 下 grep 无匹配不退出）、modprobe `lsmod` 模块名兼容 `-`/`_` 两种写法、提取 `__CHECK__` 单行辅助消除重复代码、清理 `tr ' ' '`/`changed` 死代码、dry-run 计划与执行顺序同步；README 功能表补列 2.3.0 新增模块、示例区补充 `HARDENING_LEVEL`/`EXTRA_ALLOW_PORTS` 用法 |
 | 2.3.0 | 2026-08-15 | **安全纵深增强**：新增服务发现与"不可触碰"确认（对齐 hardening-skill 阶段0）、SSH 公钥存在性预检防逻辑锁死、auditd 系统审计、内核模块禁用（modprobe 黑名单）、安全工具+自动化扫描 cron（rkhunter/clamav/lynis）、nginx 安全头、分级加固等级 `HARDENING_LEVEL`、合规报告、`--dry-run` 预演、flock 并发锁、备份清理策略、SSH drop-in 全参数覆盖、`tcp_tw_reuse` NAT 风险注释；**服务发现增强**：推断 enabled 服务端口 + `EXTRA_ALLOW_PORTS` 显式声明，覆盖"服务在扫描后才启动"的时序盲区 |
