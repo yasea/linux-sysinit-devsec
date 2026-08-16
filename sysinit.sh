@@ -2,7 +2,7 @@
 ################################################################################
 #   Author      : 0x5c0f (Enhanced with Dev-Sec Baseline & Anti-Lockout)
 #   Date        : 2026-08-14
-#   Version     : 2.2.2-PROD
+#   Version     : 2.3.0
 #   Description : Linux Server Fast Init, Performance & Dev-Sec Security Hardening
 #   Usage       : bash ./sysinit.sh
 #   Environment :
@@ -37,9 +37,13 @@ fi
 # 用法帮助
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'USAGE'
-用法: bash sysinit.sh [--help]
+用法: bash sysinit.sh [--help] [--dry-run]
 
 一键完成 Linux 服务器初始化与 Dev-Sec 安全基线加固。
+
+选项:
+  --help      显示本帮助
+  --dry-run   预演模式：仅检测环境并打印将执行的计划，不实际修改系统
 
 常用环境变量:
   AUTO_FIREWALL=yes        非交互防火墙（默认推荐规则）
@@ -49,14 +53,24 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   SSH_ALLOW_IPS=           SSH 放行源 IP（逗号分隔；留空=自动白名单当前 IP 或全放+告警）
   AUTO_WHITELIST_CURRENT_IP=yes  非交互且 AUTO_FIREWALL=yes 时自动放行当前连接 IP
   TZ=Asia/Shanghai         时区
+  HARDENING_LEVEL=standard 分级加固: minimal|standard|enhanced（一键启用对应安全模块）
   ENABLE_SWAP=yes / ENABLE_FAIL2BAN=yes / DISABLE_IPV6=yes / ENABLE_JOURNALD=yes
   ENABLE_UNATTENDED=yes / ENABLE_SYSSTAT=yes / CREATE_DATA_DIRS=yes
+  ENABLE_AUDITD=yes / ENABLE_MODPROBE_HARDEN=yes / ENABLE_SECURITY_TOOLS=yes / ENABLE_NGINX_HARDEN=yes
   BACKUP_DIR=/var/backups/sysinit   LOG_DIR=/var/log   LOG_LEVEL=INFO
 
 示例:
   AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
+  HARDENING_LEVEL=enhanced AUTO_FIREWALL=yes AUTO_SSH=yes bash sysinit.sh
+  bash sysinit.sh --dry-run
 USAGE
     exit 0
+fi
+
+# 预演模式：仅检测并打印计划，不修改系统
+__DRY_RUN__=""
+if [ "${1:-}" = "--dry-run" ]; then
+    __DRY_RUN__="1"
 fi
 
 # ==============================================================================
@@ -73,6 +87,8 @@ declare -- __INIT_SYSTEM__=""
 declare -- __LOG_FILE__=""
 declare -- __TMP_FILES__=""
 declare -- __INSTALL_FAILED_PKGS__=""
+declare -- __PROTECTED_PORTS__=""      # 服务发现确认的"不可触碰"端口（空格分隔）
+declare -- __PROTECTED_SERVICES__=""   # 服务发现确认的"不可触碰"服务（空格分隔）
 
 declare -- SOURCEDIR="/data/softsrc"
 declare -- SOFTDIR="/data/software"
@@ -94,10 +110,45 @@ declare -- SOFTDIR="/data/software"
 : "${ENABLE_JOURNALD:=no}"
 : "${ENABLE_UNATTENDED:=no}"
 : "${ENABLE_SYSSTAT:=no}"
+: "${ENABLE_AUDITD:=no}"
+: "${ENABLE_MODPROBE_HARDEN:=no}"
+: "${ENABLE_SECURITY_TOOLS:=no}"
+: "${ENABLE_NGINX_HARDEN:=no}"
 : "${CREATE_DATA_DIRS:=no}"
+: "${HARDENING_LEVEL:=}"   # minimal|standard|enhanced：一键启用对应等级的可选安全模块
+: "${EXTRA_ALLOW_PORTS:=}" # 额外放行端口（逗号分隔），覆盖服务发现时序盲区（服务在扫描后才启动）
 
 # 标记 yes/no 环境变量
 __ENV_YES__() { [[ "${1}" =~ ^[Yy][Ee][Ss]$ ]]; }
+
+# ==============================================================================
+# 0.0.1 分级加固等级解析（minimal/standard/enhanced）
+# 通过 HARDENING_LEVEL 一键启用对应等级的可选安全模块，避免"全量或全无"
+#   minimal  : 仅基础加固（不额外启用可选模块）
+#   standard : 启用 auditd + modprobe 内核模块禁用 + fail2ban + journald
+#   enhanced : 在 standard 基础上 + 安全工具扫描 + nginx 安全头 + unattended
+# 显式设置的 ENABLE_* 优先于等级默认值（不覆盖用户已明确指定的开关）
+# ==============================================================================
+__APPLY_HARDENING_LEVEL__() {
+    case "${HARDENING_LEVEL}" in
+        standard|enhanced)
+            [ "${ENABLE_AUDITD}" = "no" ]          && ENABLE_AUDITD=yes
+            [ "${ENABLE_MODPROBE_HARDEN}" = "no" ] && ENABLE_MODPROBE_HARDEN=yes
+            [ "${ENABLE_FAIL2BAN}" = "no" ]        && ENABLE_FAIL2BAN=yes
+            [ "${ENABLE_JOURNALD}" = "no" ]        && ENABLE_JOURNALD=yes
+            ;;
+    esac
+    case "${HARDENING_LEVEL}" in
+        enhanced)
+            [ "${ENABLE_SECURITY_TOOLS}" = "no" ]  && ENABLE_SECURITY_TOOLS=yes
+            [ "${ENABLE_NGINX_HARDEN}" = "no" ]    && ENABLE_NGINX_HARDEN=yes
+            [ "${ENABLE_UNATTENDED}" = "no" ]      && ENABLE_UNATTENDED=yes
+            ;;
+    esac
+    if [ -n "${HARDENING_LEVEL}" ]; then
+        __SAY__ INFO "应用加固等级: ${HARDENING_LEVEL}"
+    fi
+}
 
 # ==============================================================================
 # 0.0 错误处理与清理 trap
@@ -187,7 +238,7 @@ __BANNER__() {
     printf "${C}"
     printf "==============================================================\n"
     printf "   Linux Server Fast Init & Dev-Sec Security Hardening\n"
-    printf "   sysinit.sh  v2.2.2\n"
+    printf "   sysinit.sh  v2.3.0\n"
     printf "==============================================================\n"
     printf "${R}\n"
 }
@@ -216,6 +267,10 @@ __BACKUP__() {
             __SAY__ WARN "备份失败: ${src}"
         fi
     fi
+    # 备份清理策略：每个源文件仅保留最近 10 份，更早的删除（防止长期积累）
+    local base
+    base="$(basename "${src}")"
+    ${__SUDO__} bash -c "ls -1t '${backup_root}'/${base}.* 2>/dev/null | tail -n +11 | xargs -r rm -f" 2>/dev/null || true
 }
 
 # ==============================================================================
@@ -518,7 +573,9 @@ __SET_HOSTNAME__() {
             __SAY__ WARN "清理 /etc/hosts 旧 127.0.1.1 条目失败（/etc/hosts 可能只读或为挂载文件），跳过"
         fi
     fi
-    echo "127.0.1.1 ${hostname}" | ${__SUDO__} tee -a /etc/hosts >/dev/null
+    if ! echo "127.0.1.1 ${hostname}" | ${__SUDO__} tee -a /etc/hosts >/dev/null 2>&1; then
+        __SAY__ WARN "写入 /etc/hosts 失败（/etc/hosts 可能只读或为挂载文件），主机名已设置但未同步到 hosts"
+    fi
 }
 
 __SET_SOURCEREPO__() {
@@ -740,10 +797,6 @@ __SET_UFW__() {
     __SAY__ INFO "重置 ufw 规则（保证幂等，重建干净规则集）..."
     ${__SUDO__} ufw --force reset >/dev/null 2>&1 || true
 
-    # 默认策略
-    ${__SUDO__} ufw default deny incoming
-    ${__SUDO__} ufw default allow outgoing
-
     # 交互询问：是否自动将当前连接 IP 加入白名单
     local auto_whitelist="no"
     if [ -t 0 ] && [ "${AUTO_FIREWALL}" != "yes" ]; then
@@ -780,6 +833,20 @@ __SET_UFW__() {
     else
         __SAY__ WARN "SSH_ALLOW_IPS 未设置，SSH 放行所有来源（云安全组应限源兜底）"
         ${__SUDO__} ufw allow "${SSH_PORT}"/tcp
+    fi
+
+    # 默认策略（置于 SSH 放行之后：先放行 SSH 再设 deny，缩小无保护窗口）
+    ${__SUDO__} ufw default deny incoming
+    ${__SUDO__} ufw default allow outgoing
+
+    # 放行服务发现确认的"不可触碰"端口（防止误锁业务）
+    if [ -n "${__PROTECTED_PORTS__}" ]; then
+        __SAY__ INFO "放行服务发现确认的受保护端口..."
+        for p in ${__PROTECTED_PORTS__}; do
+            [ "${p}" = "${SSH_PORT}" ] && continue  # SSH 已单独处理
+            ${__SUDO__} ufw allow "${p}"/tcp 2>/dev/null || true
+            __SAY__ INFO "放行受保护端口: ${p}/tcp"
+        done
     fi
 
     # 交互添加额外 IP:端口规则
@@ -851,6 +918,8 @@ net.ipv4.tcp_syn_retries = 2
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_tw_reuse = 1
+# 注：tcp_tw_reuse 在 NAT 环境（云服务器常见）有已知 TCP 序列号冲突风险；
+#     较新内核默认已启用。若遇 NAT 下连接异常，可改为 0。
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_max_orphans = 3276800
 net.ipv4.ip_local_port_range = 1024 65535
@@ -1124,10 +1193,300 @@ LOGROTEOF
     __SAY__ SUCCESS "命令审计日志已配置（权限 666+chattr +a，logrotate 已设置）"
 }
 
+# ==============================================================================
+# 6.1 可选：auditd 系统级审计（认证/sudo/cron/模块加载等）
+# ==============================================================================
+__SET_AUDITD__() {
+    if ! __ENV_YES__ "${ENABLE_AUDITD}"; then
+        return 0
+    fi
+    __SAY__ INFO "安装并配置 auditd 系统级审计..."
+
+    case "${__INSTALL_CMD__}" in
+        apt-get) __INSTALL_PACKAGES__ auditd audispd-plugins ;;
+        yum|dnf) __INSTALL_PACKAGES__ audit audit-libs ;;
+        *) __SAY__ WARN "auditd 在当前系统包管理器下可能不可用，跳过"; return 0 ;;
+    esac
+
+    # 基础审计规则（认证、sudo、cron、模块加载、时间、权限变更）
+    ${__SUDO__} tee /etc/audit/rules.d/sysinit.rules >/dev/null <<'AUDITEOF'
+## sysinit auditd 基础规则
+## 认证与账户
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+## 特权命令
+-a always,exit -F path=/usr/bin/sudo -F perm=x -k privileged
+-a always,exit -F path=/usr/bin/su -F perm=x -k privileged
+## cron 与计划任务
+-w /etc/cron.allow -p wa -k cron
+-w /etc/cron.deny -p wa -k cron
+-w /etc/crontab -p wa -k cron
+-w /etc/cron.d/ -p wa -k cron
+-w /etc/cron.daily/ -p wa -k cron
+-w /etc/cron.hourly/ -p wa -k cron
+-w /etc/cron.weekly/ -p wa -k cron
+-w /etc/cron.monthly/ -p wa -k cron
+## 内核模块加载/卸载
+-w /sbin/insmod -p x -k modules
+-w /sbin/rmmod -p x -k modules
+-w /sbin/modprobe -p x -k modules
+-a always,exit -F arch=b64 -S init_module -S delete_module -k modules
+## 时间同步
+-w /etc/localtime -p wa -k time
+## 会话与登录
+-w /var/log/faillog -p wa -k logins
+-w /var/log/lastlog -p wa -k logins
+## 系统信息
+-w /etc/hostname -p wa -k system-locale
+-w /etc/issue -p wa -k system-locale
+-w /etc/issue.net -p wa -k system-locale
+## 权限变更
+-a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod
+-a always,exit -F arch=b64 -S chown -S fchown -S fchownat -S lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
+AUDITEOF
+
+    # 限制审计日志大小与保留策略
+    if [ -f /etc/audit/auditd.conf ]; then
+        __BACKUP__ /etc/audit/auditd.conf
+        ${__SUDO__} sed -i 's/^max_log_file\s*=.*/max_log_file = 100/' /etc/audit/auditd.conf
+        ${__SUDO__} sed -i 's/^num_logs\s*=.*/num_logs = 5/' /etc/audit/auditd.conf
+        ${__SUDO__} sed -i 's/^max_log_file_action\s*=.*/max_log_file_action = ROTATE/' /etc/audit/auditd.conf
+    fi
+
+    # 加载规则并启用
+    ${__SUDO__} augenrules --load 2>/dev/null || true
+    ${__SUDO__} systemctl enable --now auditd 2>/dev/null || true
+
+    __SAY__ SUCCESS "auditd 已启用（认证/sudo/cron/模块/权限审计规则已加载）"
+}
+
+# ==============================================================================
+# 6.2 可选：内核模块禁用（modprobe 黑名单，禁用高风险协议/文件系统）
+# ==============================================================================
+__SET_MODPROBE_HARDEN__() {
+    if ! __ENV_YES__ "${ENABLE_MODPROBE_HARDEN}"; then
+        return 0
+    fi
+    __SAY__ INFO "配置内核模块禁用（modprobe 黑名单）..."
+
+    # 单一模块清单：heredoc 与卸载循环共用，避免改一处漏一处
+    local mods=(cramfs freevxfs jffs2 hfs hfsplus squashfs udf dccp sctp rds tipc bluetooth btusb can firewire-core net-pf-31)
+
+    # 生成 modprobe 黑名单（按类别分组注释）
+    {
+        echo "## sysinit 内核模块加固：禁用高风险/非必要协议与文件系统"
+        echo "## 文件系统（易被用于隐藏恶意数据）"
+        for m in cramfs freevxfs jffs2 hfs hfsplus squashfs udf; do
+            echo "install ${m} /bin/false"
+        done
+        echo "## 高风险网络协议（DCCP/SCTP/RDS/TIPC 等，非必要场景禁用）"
+        for m in dccp sctp rds tipc; do
+            echo "install ${m} /bin/false"
+        done
+        echo "## 蓝牙（服务器场景通常不需要）"
+        for m in bluetooth btusb; do
+            echo "install ${m} /bin/false"
+        done
+        echo "## 罕见/易被滥用的协议"
+        for m in can firewire-core net-pf-31; do
+            echo "install ${m} /bin/false"
+        done
+        echo "## USB 存储（物理安全敏感场景；默认注释，需显式启用才生效）"
+        echo "# install usb-storage /bin/false"
+    } | ${__SUDO__} tee /etc/modprobe.d/sysinit-hardening.conf >/dev/null
+    ${__SUDO__} chmod 644 /etc/modprobe.d/sysinit-hardening.conf
+
+    # 立即卸载已加载的高风险模块（若未在使用）
+    # 注：lsmod 模块名可能用下划线而非连字符（如 firewire_core），正则兼容两种写法
+    for m in "${mods[@]}"; do
+        local pat="${m//-/_}"
+        if ${__SUDO__} lsmod 2>/dev/null | grep -qE "^(${m//[-_]/[-_]}|${pat})[[:space:]]"; then
+            ${__SUDO__} modprobe -r "${m}" 2>/dev/null || true
+        fi
+    done
+
+    __SAY__ SUCCESS "内核模块禁用已配置（/etc/modprobe.d/sysinit-hardening.conf）"
+}
+
+# ==============================================================================
+# 6.3 可选：安全工具安装 + 自动化扫描 cron（rkhunter/clamav/lynis）
+# ==============================================================================
+__SET_SECURITY_TOOLS__() {
+    if ! __ENV_YES__ "${ENABLE_SECURITY_TOOLS}"; then
+        return 0
+    fi
+    __SAY__ INFO "安装安全扫描工具（rkhunter/clamav/lynis）..."
+
+    case "${__INSTALL_CMD__}" in
+        apt-get)
+            __INSTALL_PACKAGES__ rkhunter clamav clamav-daemon lynis
+            ;;
+        yum|dnf)
+            __INSTALL_PACKAGES__ rkhunter clamav clamav-update lynis
+            ;;
+        *) __SAY__ WARN "安全工具在当前系统包管理器下可能不可用，跳过"; return 0 ;;
+    esac
+
+    # rkhunter 初始化数据库
+    if UTILS__CMD_EXISTS__ rkhunter; then
+        ${__SUDO__} rkhunter --propupd 2>/dev/null || true
+    fi
+
+    # 自动化扫描 cron（每日 rkhunter、每周 ClamAV、每月 Lynis）
+    ${__SUDO__} tee /etc/cron.d/sysinit-security-scan >/dev/null <<'CRONEOF'
+## sysinit 自动化安全扫描
+## 每日 rkhunter（rootkit 检测）
+0 3 * * * root /usr/bin/rkhunter --check --skip-keypress --report-warnings-only 2>/dev/null | /usr/bin/logger -t rkhunter
+## 每周 ClamAV 全盘扫描（周日 4 点）
+0 4 * * 0 root /usr/bin/clamscan -r -i / 2>/dev/null | /usr/bin/logger -t clamscan
+## 每月 Lynis 系统审计（每月 1 日 5 点）
+0 5 1 * * root /usr/sbin/lynis audit system --cronjob --quiet 2>/dev/null | /usr/bin/logger -t lynis
+CRONEOF
+    ${__SUDO__} chmod 644 /etc/cron.d/sysinit-security-scan
+
+    __SAY__ SUCCESS "安全工具已安装，自动化扫描 cron 已配置（每日 rkhunter/每周 ClamAV/每月 Lynis）"
+}
+
+# ==============================================================================
+# 6.4 可选：nginx 安全头加固（检测到 nginx 时应用）
+# ==============================================================================
+__SET_NGINX_HARDEN__() {
+    if ! __ENV_YES__ "${ENABLE_NGINX_HARDEN}"; then
+        return 0
+    fi
+    if ! UTILS__CMD_EXISTS__ nginx; then
+        __SAY__ INFO "未检测到 nginx，跳过 Web 安全头加固"
+        return 0
+    fi
+    __SAY__ INFO "检测到 nginx，应用 Web 安全头加固..."
+
+    # 生成安全头片段（供各 server 块 include）
+    ${__SUDO__} tee /etc/nginx/sysinit-security-headers.conf >/dev/null <<'NGINXEOF'
+## sysinit nginx 安全响应头
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header X-XSS-Protection "1; mode=block" always;
+# HSTS（仅 HTTPS 场景启用；HTTP 站点请注释下行）
+# add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+# CSP（按业务调整；默认较宽松，避免误伤内联脚本）
+# add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'" always;
+NGINXEOF
+    ${__SUDO__} chmod 644 /etc/nginx/sysinit-security-headers.conf
+
+    # 在 http 块注入 include（若未注入过）
+    local nginx_conf="/etc/nginx/nginx.conf"
+    if [ -f "${nginx_conf}" ] && ! grep -q "sysinit-security-headers" "${nginx_conf}" 2>/dev/null; then
+        __BACKUP__ "${nginx_conf}"
+        # 在 http { 块内第一行注入 include
+        ${__SUDO__} sed -i '/^\s*http\s*{/a\    include /etc/nginx/sysinit-security-headers.conf;' "${nginx_conf}" 2>/dev/null || true
+    fi
+
+    # 语法校验，失败则回滚
+    if ${__SUDO__} nginx -t 2>/dev/null; then
+        ${__SUDO__} systemctl reload nginx 2>/dev/null || true
+        __SAY__ SUCCESS "nginx 安全头已应用并重载"
+    else
+        __SAY__ WARN "nginx -t 校验失败，回滚 nginx.conf 修改"
+        if [ -f "${nginx_conf}" ]; then
+            ${__SUDO__} sed -i '/sysinit-security-headers/d' "${nginx_conf}" 2>/dev/null || true
+        fi
+    fi
+}
+
+# ==============================================================================
+# 7.6 合规报告（CIS 检查项清单 + 通过/未通过）
+# ==============================================================================
+__COMPLIANCE_REPORT__() {
+    __SAY__ INFO "生成合规检查报告（CIS 基线检查项）..."
+
+    local pass=0 fail=0
+    local -a report=()
+
+    # 辅助：单行检查项（条件为真则 PASS，否则 FAIL）
+    __CHECK__() {
+        local item="$1" cond="$2"
+        if [ "${cond}" = "1" ]; then
+            pass=$((pass+1))
+            report+=("  [PASS] ${item}")
+        else
+            fail=$((fail+1))
+            report+=("  [FAIL] ${item}")
+        fi
+    }
+
+    # --- 检查项 ---
+    # 1. 内核安全参数
+    __CHECK__ "ASLR 内存随机化 (kernel.randomize_va_space=2)" \
+        "$([ "$(cat /proc/sys/kernel/randomize_va_space 2>/dev/null)" = "2" ] && echo 1 || echo 0)"
+    __CHECK__ "SYN cookies 防洪水 (tcp_syncookies=1)" \
+        "$([ "$(cat /proc/sys/net/ipv4/tcp_syncookies 2>/dev/null)" = "1" ] && echo 1 || echo 0)"
+    __CHECK__ "反向路径过滤 (rp_filter=1)" \
+        "$([ "$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null)" = "1" ] && echo 1 || echo 0)"
+
+    # 2. 文件权限
+    local shadow_perm
+    shadow_perm=$(stat -c %a /etc/shadow 2>/dev/null)
+    __CHECK__ "/etc/shadow 权限 (400/600)" \
+        "$([ "${shadow_perm}" = "400" ] || [ "${shadow_perm}" = "600" ] && echo 1 || echo 0)"
+    __CHECK__ "/tmp 粘滞位 (1777)" \
+        "$([ "$(stat -c %a /tmp 2>/dev/null)" = "1777" ] && echo 1 || echo 0)"
+
+    # 3. 密码策略
+    __CHECK__ "密码最大有效期 (PASS_MAX_DAYS=90)" \
+        "$(grep -qE "^PASS_MAX_DAYS\s+90" /etc/login.defs 2>/dev/null && echo 1 || echo 0)"
+
+    # 4. SSH 加固（用 sshd -T 实际生效值，同时覆盖主配置与 drop-in，避免误报）
+    # 注：sshd -T 可能因权限/环境失败，用 || true 兜底避免 set -e 退出
+    local sshd_effective
+    sshd_effective=$(${__SUDO__} sshd -T 2>/dev/null || true)
+    __CHECK__ "SSH 禁用密码认证" \
+        "$(echo "${sshd_effective}" | grep -qE "^passwordauthentication\s+no" && echo 1 || echo 0)"
+    __CHECK__ "SSH 禁用 root 密码登录" \
+        "$(echo "${sshd_effective}" | grep -qE "^permitrootlogin\s+prohibit-password" && echo 1 || echo 0)"
+
+    # 5. 防火墙
+    __CHECK__ "ufw 防火墙已启用" \
+        "$(${__SUDO__} ufw status 2>/dev/null | grep -q "Status: active" && echo 1 || echo 0)"
+
+    # 6. 审计
+    __CHECK__ "auditd 审计规则已配置" \
+        "$([ -d /etc/audit/rules.d ] && [ -f /etc/audit/rules.d/sysinit.rules ] && echo 1 || echo 0)"
+
+    # 7. 命令审计
+    __CHECK__ "命令审计 (PROMPT_COMMAND)" \
+        "$([ -f /etc/profile.d/cmdAudit.sh ] && echo 1 || echo 0)"
+
+    # 8. 内核模块禁用
+    __CHECK__ "内核模块禁用配置" \
+        "$([ -f /etc/modprobe.d/sysinit-hardening.conf ] && echo 1 || echo 0)"
+
+    # 输出报告
+    echo ""
+    __SAY__ INFO "========== 合规检查报告 (CIS 基线) =========="
+    printf "%s\n" "${report[@]}"
+    echo ""
+    __SAY__ INFO "通过: ${pass}  未通过: ${fail}  总计: $((pass+fail))"
+    if [ "${fail}" -gt 0 ]; then
+        __SAY__ WARN "存在未通过项，建议按上方 [FAIL] 项逐条排查"
+    else
+        __SAY__ SUCCESS "全部检查项通过"
+    fi
+}
+
 __SET_DISABLE_SERVICES__() {
     __SAY__ INFO "关闭高风险与非必须的本地系统服务..."
     local services="postfix.service rpcbind.service rpcbind.socket exim4.service"
     for service in ${services}; do
+        # 跳过用户确认的"不可触碰"服务
+        if echo " ${__PROTECTED_SERVICES__} " | grep -q " ${service} "; then
+            __SAY__ INFO "跳过受保护服务 -> ${service}"
+            continue
+        fi
         # 同时检查 active 和 enabled 状态
         if ${__SUDO__} systemctl is-active --quiet "${service}" 2>/dev/null; then
             __SAY__ INFO "停止服务 -> ${service}"
@@ -1142,8 +1501,161 @@ __SET_DISABLE_SERVICES__() {
 
 
 # ==============================================================================
+# 0.13 服务发现与"不可触碰"确认（对齐 hardening-skill 阶段0）
+# 扫描监听端口与运行服务，交互确认哪些必须保持不受影响，供防火墙/禁用服务参考
+# ==============================================================================
+__SERVICE_DISCOVERY__() {
+    __SAY__ INFO "扫描当前监听端口与运行服务（服务发现）..."
+
+    # 收集监听端口（ss 优先，fallback netstat）
+    local listen_ports=""
+    if UTILS__CMD_EXISTS__ ss; then
+        listen_ports=$(ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' | sort -un)
+    elif UTILS__CMD_EXISTS__ netstat; then
+        listen_ports=$(netstat -tlnp 2>/dev/null | awk 'NR>2 {split($4,a,":"); print a[length(a)]}' | sort -un)
+    fi
+
+    # 收集运行中的 systemd 服务
+    local running_services=""
+    if [ "${__INIT_SYSTEM__}" = "systemd" ]; then
+        running_services=$(${__SUDO__} systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+    fi
+
+    # 推断 enabled 服务的已知端口（覆盖"服务在扫描后才启动"的时序盲区）
+    # 从 systemd 单元文件中的 Listen 指令 + /etc/services 提取端口
+    local inferred_ports=""
+    if [ "${__INIT_SYSTEM__}" = "systemd" ]; then
+        local enabled_units
+        enabled_units=$(${__SUDO__} systemctl list-unit-files --type=service --state=enabled --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+        for unit in ${enabled_units}; do
+            # 从单元文件提取 ListenStream/Listen 端口
+            # 兼容多种写法：ListenStream=8080 / ListenStream=0.0.0.0:8080 / ListenStream=[::]:8080
+            local unit_file
+            unit_file=$(${__SUDO__} systemctl show "${unit}" -p FragmentPath --value 2>/dev/null || true)
+            [ -z "${unit_file}" ] && continue
+            local p
+            p=$(grep -hoE "Listen(Stream|Datagram)?\s*=\s*[^#]*" "${unit_file}" 2>/dev/null \
+                | sed -E 's/.*[=:]([0-9]+)$/\1/' \
+                | grep -E '^[0-9]+$' \
+                | sort -un \
+                | tr '\n' ' ' || true)
+            [ -n "${p}" ] && inferred_ports="${inferred_ports} ${p}"
+        done
+        # 从 /etc/services 提取常见服务端口（按服务名匹配）
+        for unit in ${enabled_units}; do
+            local svc_name
+            svc_name=$(basename "${unit}" .service)
+            local p2
+            p2=$(grep -iE "^${svc_name}\s+[0-9]+/tcp" /etc/services 2>/dev/null | awk '{print $2}' | cut -d/ -f1 | head -1 || true)
+            [ -n "${p2}" ] && inferred_ports="${inferred_ports} ${p2}"
+        done
+    fi
+
+    # 合并 EXTRA_ALLOW_PORTS（用户显式声明的端口，最高优先级）
+    if [ -n "${EXTRA_ALLOW_PORTS}" ]; then
+        local IFS_BAK="${IFS}"
+        IFS=','
+        for p in ${EXTRA_ALLOW_PORTS}; do
+            p=${p//[[:space:]]/}
+            [ -n "${p}" ] && inferred_ports="${inferred_ports} ${p}"
+        done
+        IFS="${IFS_BAK}"
+    fi
+
+    # 去重并排序
+    local all_ports
+    all_ports=$(echo "${listen_ports} ${inferred_ports}" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')
+
+    # 展示监听端口
+    if [ -n "${listen_ports}" ]; then
+        __SAY__ INFO "当前监听端口: $(echo ${listen_ports} | tr '\n' ' ')"
+    else
+        __SAY__ INFO "未检测到监听端口（或 ss/netstat 不可用）"
+    fi
+    if [ -n "${inferred_ports}" ]; then
+        __SAY__ INFO "推断 enabled 服务端口 + EXTRA_ALLOW_PORTS:${inferred_ports}"
+    fi
+
+    # 交互模式：确认不可触碰端口
+    if [ -t 0 ] && [ "${AUTO_FIREWALL}" != "yes" ]; then
+        echo ""
+        __SAY__ INFO "========== 服务发现确认 =========="
+        __SAY__ INFO "以下端口将被防火墙默认 deny（仅放行 SSH 与白名单）。"
+        echo "  若某些端口/服务必须保持对外可达，请在此确认，脚本将自动放行。"
+        echo ""
+        if __CONFIRM__ "是否需要额外放行某些监听端口（防止误锁业务）？" "n"; then
+            while true; do
+                local p
+                p=$(__PROMPT__ "要放行的端口号（留空结束）" "")
+                [ -z "${p}" ] && break
+                if [[ "${p}" =~ ^[0-9]+$ ]] && [ "${p}" -ge 1 ] && [ "${p}" -le 65535 ]; then
+                    __PROTECTED_PORTS__="${__PROTECTED_PORTS__} ${p}"
+                    __SAY__ INFO "已加入放行清单: ${p}"
+                else
+                    __SAY__ WARN "端口号无效 (1-65535): ${p}，跳过"
+                fi
+            done
+        fi
+
+        # 确认不可触碰服务（禁用服务模块参考）
+        if [ -n "${running_services}" ]; then
+            echo ""
+            __SAY__ INFO "以下运行中的服务将被评估是否禁用（postfix/rpcbind/exim4 等非必要服务）。"
+            if __CONFIRM__ "是否有必须保留的服务（输入服务名，留空跳过）？" "n"; then
+                while true; do
+                    local s
+                    s=$(__PROMPT__ "要保留的服务名（如 postfix.service，留空结束）" "")
+                    [ -z "${s}" ] && break
+                    __PROTECTED_SERVICES__="${__PROTECTED_SERVICES__} ${s}"
+                    __SAY__ INFO "已加入保留清单: ${s}"
+                done
+            fi
+        fi
+    else
+        # 非交互模式：自动放行所有当前监听端口 + 推断端口 + EXTRA_ALLOW_PORTS（除 SSH 外）
+        if [ -n "${all_ports}" ]; then
+            __SAY__ INFO "非交互模式：自动将当前监听端口 + 推断端口 + EXTRA_ALLOW_PORTS 加入放行清单（防止误锁业务）"
+            __PROTECTED_PORTS__="${all_ports}"
+        fi
+    fi
+
+    if [ -n "${__PROTECTED_PORTS__}" ]; then
+        __SAY__ INFO "受保护端口:${__PROTECTED_PORTS__}"
+    fi
+    if [ -n "${__PROTECTED_SERVICES__}" ]; then
+        __SAY__ INFO "受保护服务: ${__PROTECTED_SERVICES__}"
+    fi
+}
+
+
+# ==============================================================================
 # 7. Dev-Sec SSH 加固与"防锁死（Anti-Lockout）"配置引擎
 # ==============================================================================
+# 公钥存在性预检：应用 PasswordAuthentication no 前确认已有可用公钥，杜绝逻辑锁死
+# 返回 0=有公钥，1=无公钥
+__SSH_HAS_PUBKEY__() {
+    local user_home
+    if [ "$(id -u)" -eq 0 ]; then
+        user_home="/root"
+    else
+        user_home=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
+        [ -z "${user_home}" ] && user_home="${HOME}"
+    fi
+    local ak="${user_home}/.ssh/authorized_keys"
+    if [ -f "${ak}" ] && [ -s "${ak}" ]; then
+        return 0
+    fi
+    # 兜底：检查系统内其他 root 可登录账户是否已有公钥（多管理员场景）
+    if [ "$(id -u)" -eq 0 ]; then
+        for h in /home/*/; do
+            if [ -f "${h}.ssh/authorized_keys" ] && [ -s "${h}.ssh/authorized_keys" ]; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
 __SET_SSHD_CONFIG__() {
     local sshd_config="/etc/ssh/sshd_config"
 
@@ -1205,12 +1717,23 @@ __SET_SSHD_CONFIG__() {
             ssh_params["PermitRootLogin"]="prohibit-password"
         fi
         if __CONFIRM__ "是否禁用密码认证，仅允许密钥登录（推荐）？" "y"; then
-            ssh_params["PasswordAuthentication"]="no"
+            # 公钥预检：禁用密码前确认已有可用公钥，防止逻辑锁死
+            if __SSH_HAS_PUBKEY__; then
+                ssh_params["PasswordAuthentication"]="no"
+            else
+                __SAY__ WARN "未检测到可用 SSH 公钥（authorized_keys 为空），为防锁死，跳过禁用密码认证"
+                __SAY__ WARN "请先配置公钥后手动执行: sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
+            fi
         fi
     else
         # 非交互模式默认推荐
         ssh_params["PermitRootLogin"]="prohibit-password"
-        ssh_params["PasswordAuthentication"]="no"
+        if __SSH_HAS_PUBKEY__; then
+            ssh_params["PasswordAuthentication"]="no"
+        else
+            __SAY__ WARN "未检测到可用 SSH 公钥，为防锁死，本次跳过 PasswordAuthentication no（仅密钥登录）"
+            __SAY__ WARN "请先配置公钥，再手动启用: sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
+        fi
     fi
 
     for param in "${!ssh_params[@]}"; do
@@ -1224,16 +1747,21 @@ __SET_SSHD_CONFIG__() {
 
     # v2.2.0 新增：修正 sshd_config.d/*.conf 中的 PasswordAuthentication yes 覆盖
     # 坑：sshd "首值生效"机制，cloud-init drop-in 先于主配置读取 → 主配置改了无效
+    # v2.2.3 增强：覆盖检查扩展到脚本设置的所有参数（PasswordAuthentication/PermitRootLogin/MaxAuthTries 等）
     if [ -d /etc/ssh/sshd_config.d ]; then
-        __SAY__ INFO "检查 sshd_config.d/*.conf 中的密码认证覆盖..."
+        __SAY__ INFO "检查 sshd_config.d/*.conf 中的参数覆盖（首值生效机制）..."
         local dropin
         for dropin in /etc/ssh/sshd_config.d/*.conf; do
             [ -f "${dropin}" ] || continue
-            if grep -qiE "^\s*PasswordAuthentication\s+yes" "${dropin}" 2>/dev/null; then
-                __BACKUP__ "${dropin}"
-                ${__SUDO__} sed -i 's/^\(\s*PasswordAuthentication\s*\)yes/\1no/I' "${dropin}"
-                __SAY__ INFO "已修正 ${dropin} 中的 PasswordAuthentication yes -> no"
-            fi
+            # 对脚本要设置的每个参数，若 drop-in 中已有该参数则统一改写为脚本目标值
+            for param in "${!ssh_params[@]}"; do
+                local value="${ssh_params[$param]}"
+                if grep -qiE "^\s*${param}\s+" "${dropin}" 2>/dev/null; then
+                    __BACKUP__ "${dropin}"
+                    ${__SUDO__} sed -i "s/^\(\s*${param}\s*\).*/\1${value}/I" "${dropin}"
+                    __SAY__ INFO "已修正 ${dropin} 中的 ${param} -> ${value}"
+                fi
+            done
         done
     fi
 
@@ -1418,6 +1946,16 @@ __SET_DATA_DIRS__() {
 # 8. 执行主干与报告检查
 # ==============================================================================
 __MAIN__() {
+    # 并发锁：防止两个实例同时运行互相覆盖配置
+    local lockfile="/var/lock/sysinit.lock"
+    if UTILS__CMD_EXISTS__ flock; then
+        exec 9>"${lockfile}"
+        if ! flock -n 9; then
+            __SAY__ ERROR "另一个 sysinit 实例正在运行（锁 ${lockfile} 被占用），中止"
+            exit 1
+        fi
+    fi
+
     # 初始化执行日志
     __LOG_FILE__="${LOG_DIR}/sysinit-$(date +%Y%m%d-%H%M%S).log"
     ${__SUDO__} mkdir -p "${LOG_DIR}" 2>/dev/null || true
@@ -1427,8 +1965,29 @@ __MAIN__() {
     __SAY__ INFO "============= 正在运行 Linux 服务器快速安全优化初始化脚本 ============="
     __SAY__ INFO "执行日志: ${__LOG_FILE__}"
     __SAY__ INFO "配置备份目录: ${BACKUP_DIR}"
-    __SAY__ INFO "可选模块: SWAP=${ENABLE_SWAP} FAIL2BAN=${ENABLE_FAIL2BAN} IPV6_OFF=${DISABLE_IPV6} JOURNALD=${ENABLE_JOURNALD} UNATTENDED=${ENABLE_UNATTENDED} SYSSTAT=${ENABLE_SYSSTAT} DATA_DIRS=${CREATE_DATA_DIRS}"
     __BANNER__
+    __APPLY_HARDENING_LEVEL__
+    __SAY__ INFO "可选模块: SWAP=${ENABLE_SWAP} FAIL2BAN=${ENABLE_FAIL2BAN} IPV6_OFF=${DISABLE_IPV6} JOURNALD=${ENABLE_JOURNALD} UNATTENDED=${ENABLE_UNATTENDED} SYSSTAT=${ENABLE_SYSSTAT} DATA_DIRS=${CREATE_DATA_DIRS}"
+    __SAY__ INFO "安全模块: AUDITD=${ENABLE_AUDITD} MODPROBE=${ENABLE_MODPROBE_HARDEN} SEC_TOOLS=${ENABLE_SECURITY_TOOLS} NGINX=${ENABLE_NGINX_HARDEN} LEVEL=${HARDENING_LEVEL:-none}"
+
+    # 预演模式：仅检测环境并打印计划，不修改系统（跳过 precheck 标记检查）
+    if [ -n "${__DRY_RUN__}" ]; then
+        __SAY__ INFO "========== 预演模式 (--dry-run)：仅检测，不修改系统 =========="
+        __SAY__ INFO "将按以下顺序执行（与实际运行一致）："
+        echo "  1. 基础系统属性设置        : __SET_HOSTNAME__ / __SET_SOURCEREPO__"
+        echo "  2. 基础依赖包更新与安装    : __BASIC_INSTALL__（含 sysstat/unattended 可选模块）"
+        echo "  3. 服务发现 + SELinux + 防火墙 : __SERVICE_DISCOVERY__ / __SET_SELINUX__ / __SET_UFW__"
+        echo "  4. 内核性能调优 + 安全基线 : __SET_KERN_OPTIMIZE__"
+        echo "  5. Dev-Sec OS 基线加固     : __SET_DEVSEC_OS_HARDEN__（umask/密码/账户/权限）"
+        echo "  6. 时区 + 审计 + 安全模块  : __SET_TIMEZONE__ / __SET_CMDAUDIT__ / __SET_AUDITD__ / __SET_MODPROBE_HARDEN__ / __SET_SECURITY_TOOLS__ / __SET_DISABLE_SERVICES__"
+        echo "  7. SSH 加固 + 可选模块     : __SET_SSHD_CONFIG__ / __SET_DISABLE_IPV6__ / __SET_SWAP__ / __SET_FAIL2BAN__ / __SET_JOURNALD__ / __SET_NGINX_HARDEN__ / __SET_DATA_DIRS__"
+        echo "  8. 合规报告                : __COMPLIANCE_REPORT__"
+        echo ""
+        __SAY__ INFO "预演完成。如需实际执行，请去掉 --dry-run 参数运行。"
+        __CLEANUP_TMP__
+        exit 0
+    fi
+
     __PRECHECK__
     __SECTION__ "1. 基础系统属性设置"
     __SET_HOSTNAME__
@@ -1436,6 +1995,7 @@ __MAIN__() {
     __SECTION__ "2. 基础依赖包更新与安装"
     __BASIC_INSTALL__
     __SECTION__ "3. SELinux 与防火墙设置"
+    __SERVICE_DISCOVERY__
     __SET_SELINUX__
     __SET_UFW__
     __SECTION__ "4. 核心优化：高并发性能调优 + Dev-Sec 内核安全基线"
@@ -1445,6 +2005,9 @@ __MAIN__() {
     __SECTION__ "6. 系统时区与审计服务配置"
     __SET_TIMEZONE__
     __SET_CMDAUDIT__
+    __SET_AUDITD__
+    __SET_MODPROBE_HARDEN__
+    __SET_SECURITY_TOOLS__
     __SET_DISABLE_SERVICES__
     __SECTION__ "7. Dev-Sec SSH 加固与防锁死配置"
     __SET_SSHD_CONFIG__
@@ -1452,7 +2015,9 @@ __MAIN__() {
     __SET_SWAP__
     __SET_FAIL2BAN__
     __SET_JOURNALD__
+    __SET_NGINX_HARDEN__
     __SET_DATA_DIRS__
+    __COMPLIANCE_REPORT__
 
     # 所有步骤成功后写入初始化标记
     ${__SUDO__} mkdir -p /opt
